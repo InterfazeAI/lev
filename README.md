@@ -209,7 +209,7 @@ The data build refuses any source that resolves to one of the 13 S1Bench subsets
 - **Questions are answered independently.** Answers in one request do not condition on each other. Encode a joint decision as one choice, or ask in stages.
 - **Minimal edits and fine-grained ratings are weak.** Inputs that differ by one swapped word or number, and quality ratings over five levels, are where lev is least accurate and can be confidently wrong.
 - **Calibration is fitted on the training distribution.** Temperatures are chosen to transfer across task families, but a task very unlike the training mix may be less well calibrated. Check on your own data before gating on the probabilities.
-- **English only**, and a GPU for real-time use.
+- **English only**, and a GPU for real-time use, compatible with CPU with a far slower inference.
 
 ## Layout
 
