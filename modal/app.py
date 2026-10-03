@@ -15,14 +15,14 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:  # `lev` is installed in the container, not where deploy runs.
     from lev.types import Answer
 
-from dotenv import load_dotenv
-
 import modal
 
-# The deploy-time knobs below are read where `modal deploy` runs, not in the
-# container, so they come from this machine's environment — and `.env` is part
-# of it. A real export still wins, since load_dotenv does not override.
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ModuleNotFoundError:
+    pass
 
 APP_NAME = "lev"
 
