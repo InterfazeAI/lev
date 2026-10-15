@@ -23,7 +23,7 @@ Read the relevant doc before changing anything it covers; most "obvious" improve
 - **Readout.** Mode A reads label-token logits at the answer boundary whenever every label code is a single token — 68 options for this tokenizer, since the 69th code, `BQ`, is two. Above that, Mode B scores candidate text with the trained head. Training and serving route the same way (ADR-025, ADR-026); serving also skips split codes (ADR-028). Routing is in `router.py`.
 - **Calibration** is per bucket, keyed `{type}:{mode}[:{band}]`, selected by leave-one-family-out transfer ECE. `calibrate.fit` refuses `test`, `eval` and `holdout` splits — fit only on the dedicated `calibration` split.
 - **The release** (`lev-4b`) is preset `4b-instruct`, step 18750, chat prompt style. Its `lev_release.json` manifest sets the base model, prompt style and optional `adapter_scale`, and `lev.load` honours all three.
-- **The released weights were trained at commit `c6ccad7`.** Changes to data, sources, prompts or the training loop after it are not in the weights until a retrain; do not attribute a benchmark move to them.
+- **The released weights were trained on 2026-09-23 code, before this repository's first commit.** Changes to data, sources, prompts or the training loop since are not in the weights until a retrain; do not attribute a benchmark move to them.
 
 ## Running things
 
@@ -43,7 +43,7 @@ Read the relevant doc before changing anything it covers; most "obvious" improve
 - **Ask before any paid call**: `levbench` against Jev, the Anthropic backend, or a sweep. They bill per token.
 - `levbench` never sends `TYPESAFE_API_KEY` to a `--base-url` host; a custom endpoint gets `LEVBENCH_LOCAL_API_KEY` or `local`. Keep it that way.
 - Do not read `.env`.
-- This repository is mirrored by hand to the public [`InterfazeAI/lev`](https://github.com/InterfazeAI/lev); the two diverge, so a change meant for release must be ported, not assumed.
+- This is the public repository. Development happens in [`Abhinavexists/lev`](https://github.com/Abhinavexists/lev) and is ported here by hand; the two diverge, so a change made here must be ported back, not assumed.
 
 ## Comments
 
