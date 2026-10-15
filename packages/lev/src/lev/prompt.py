@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -17,21 +18,13 @@ class Layout(StrEnum):
     SCHEMA_FIRST = "schema_first"
 
 
+# The prompt format must match training (ADR-027).
 class Style(StrEnum):
-    """Prompt format recorded with the weights and shared by training and serving.
-
-    Plain uses Context/Question/Options/Answer sections. Chat uses ChatML with
-    a system prompt and an empty think block (ADR-027).
-    """
-
     PLAIN = "plain"
     CHAT = "chat"
 
 
 def label_prefix(style: Style) -> str:
-    """The character before a label token as the model emits it: a space after
-    `Answer:`, nothing at the start of an assistant turn. Verifying the wrong
-    variant passes while the scored token differs."""
     return " " if style is Style.PLAIN else ""
 
 
@@ -48,14 +41,9 @@ CHAT_ASK = {
 }
 
 
+# The prefix is reusable and the suffix varies; the suffix's final token is the one scored.
 @dataclass(frozen=True)
 class Rendered:
-    """A prompt split at the point the cache is taken.
-
-    `prefix` is computed once and reused; `suffix` is the varying part. The scored
-    position is always the final token of `suffix`.
-    """
-
     prefix: str
     suffix: str
 
@@ -78,6 +66,7 @@ def _ordered(items: list, order: list[int] | None) -> list:
     return items if order is None else [items[i] for i in order]
 
 
+# Two Noul codes select the binary readout.
 def render_question(
     name: str,
     question: Question,
@@ -85,19 +74,12 @@ def render_question(
     order: list[int] | None = None,
     style: Style = Style.PLAIN,
 ) -> str:
-    """Render one question. `codes` are Mode A label codes; None means Mode B.
-
-    `order` indexes the question's own candidates; codes are positional, so two
-    orders averaged cancel first-letter bias. A Noul with two codes is the binary
-    readout for an untrained checkpoint, which cannot rate 0-8 (ADR-007).
-    """
     if style is Style.CHAT:
         return _render_question_chat(name, question, codes, order)
     lines = [f"Question: {question.instructions or name}"]
 
     if isinstance(question, Choice):
-        # Mode B does not list options: the head embeds each candidate's text,
-        # and listing 151 intents would cost ~700 tokens per prompt.
+        # Mode B embeds candidates separately, avoiding long option lists in prompts.
         if codes:
             lines.append("Options:")
             items = _ordered(list(question.criteria.items()), order)
@@ -134,8 +116,6 @@ def render_question(
 def _render_question_chat(
     name: str, question: Question, codes: list[str] | None, order: list[int] | None
 ) -> str:
-    """reflex's headed layout: `# Criterion`, `# Options` with `A. text` lines,
-    and an explicit ask. Codes are positional, as in the plain style."""
     lines = [f"# Criterion\n{question.instructions or name}\n"]
 
     if isinstance(question, Choice):
@@ -180,14 +160,13 @@ def _render_question_chat(
     return "\n".join(lines)
 
 
+# Sorted object keys keep the rendering deterministic.
 def render_content(value: JSONContent) -> str:
-    """A `JSONContent` field as prompt text. Objects are dumped with sorted keys
-    so an identical value always renders identically, as `render_state` does."""
     return value if isinstance(value, str) else json.dumps(value, sort_keys=True)
 
 
+# Shared by Mode B serving and training, so both see the same candidate text.
 def candidate_texts(question: Question) -> list[str]:
-    """Candidate text shared by the Mode B serving and training paths."""
     if isinstance(question, Noul):
         return list(NOUL_RATING_TOKENS)
     if isinstance(question, Score):
@@ -205,7 +184,6 @@ def build(
     order: list[int] | None = None,
     style: Style = Style.PLAIN,
 ) -> Rendered:
-    """Render one question against one state, cut for the chosen layout."""
     if style is Style.CHAT:
         return _build_chat(state, name, question, codes, layout, cached_schema, order)
     state_block = f"Context:\n{render_state(state)}\n\n"
@@ -214,16 +192,13 @@ def build(
     if layout is Layout.STATE_FIRST:
         return Rendered(prefix=state_block, suffix=f"{question_block}\n{ANSWER_CUE}")
 
-    # Schema-first: the catalogue is the reusable prefix and must not depend on the
-    # state; `cached_schema` passes the whole catalogue, not just this question.
+    # The reusable schema prefix must contain the full catalogue and exclude state.
     prefix = (cached_schema if cached_schema is not None else question_block) + "\n\n"
     return Rendered(prefix=prefix, suffix=f"{state_block}{ANSWER_CUE}")
 
 
+# Score the boundary after the empty think block.
 def _build_chat(state, name, question, codes, layout, cached_schema, order) -> Rendered:
-    """ChatML: system turn, then a user turn holding evidence and criterion in
-    either order, then the opened assistant turn the label token is read from.
-    The scored position is the final `\\n\\n` after the empty think block."""
     head = f"<|im_start|>system\n{CHAT_SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n"
     evidence = f"# Evidence\n{render_state(state)}\n\n"
     criterion = render_question(name, question, codes, order, Style.CHAT)
@@ -233,12 +208,12 @@ def _build_chat(state, name, question, codes, layout, cached_schema, order) -> R
     return Rendered(prefix=f"{head}{catalogue}\n\n", suffix=f"{evidence.rstrip()}\n{CHAT_TAIL}")
 
 
+# The full question catalogue, so schema-first caching can share it across states.
 def schema_block(
-    questions: dict[str, Question],
-    codes: dict[str, list[str] | None],
+    questions: Mapping[str, Question],
+    codes: Mapping[str, list[str] | None],
     style: Style = Style.PLAIN,
 ) -> str:
-    """The full question catalogue, for schema-first caching across states."""
     return "\n\n".join(
         render_question(n, q, codes.get(n), style=style) for n, q in questions.items()
     )

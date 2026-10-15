@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
 
 
 def _measure_tokens(config, data_dir: str, sample: int = 1500) -> dict:
-    """Length distribution of real rendered prompts; the budget rests on it (ADR-016)."""
     import statistics
 
     from transformers import AutoTokenizer
@@ -21,8 +21,9 @@ def _measure_tokens(config, data_dir: str, sample: int = 1500) -> dict:
     from .train.collate import RouteCache, render
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_id)
+    if tokenizer is None:
+        raise RuntimeError(f"could not load tokenizer for {config.model_id!r}")
     rows = load_split(data_dir, Split.TRAIN)[:sample]
-    # The preset's own prompt style: `chat` adds a system turn to every prompt.
     style = Style(config.prompt_style)
     routes = RouteCache(tokenizer, config.max_label_options, style)
     lengths = sorted(
@@ -92,8 +93,6 @@ def cmd_check_data(args: argparse.Namespace) -> None:
 
 
 def _preset_names() -> list[str]:
-    """Lazy, like every CLI import, so `lev plan` and `lev check-data` run
-    without the train extra."""
     from .train.config import PRESETS
 
     return sorted(PRESETS)
@@ -120,7 +119,9 @@ def cmd_data_build(args: argparse.Namespace) -> None:
         f"(oversample {ratio}x)"
         + ("  <- raise --limit-per-source to lower this" if ratio > 2 else "")
     )
-    print(f"  sources      {len(manifest['sources'])} ({', '.join(sorted(manifest['sources']))})")
+    print(
+        f"  {'sources':<12} {len(manifest['sources'])} ({', '.join(sorted(manifest['sources']))})"
+    )
 
 
 def cmd_data_eval(args: argparse.Namespace) -> None:
@@ -193,9 +194,14 @@ def cmd_release_build(args: argparse.Namespace) -> None:
 
 
 def cmd_release_publish(args: argparse.Namespace) -> None:
+    from dotenv import dotenv_values
+
     from .release import publish
 
-    url = publish(args.release, args.repo, private=args.private)
+    # The Hub write key lives in ./.env. Read only HF_TOKEN: loading the whole file could set
+    # HF_ENDPOINT and send the token to another host.
+    token = os.environ.get("HF_TOKEN") or dotenv_values(".env").get("HF_TOKEN") or None
+    url = publish(args.release, args.repo, private=args.private, token=token)
     print(f"published -> {url}")
     print(f"\n  uv run lev serve --checkpoint {args.repo}")
 
@@ -216,10 +222,127 @@ def cmd_serve(args: argparse.Namespace) -> None:
             prompt_style=args.prompt_style,
             max_pending=args.max_pending,
             max_batch_tokens=args.max_batch_tokens,
+            score_order_average=args.score_order_average,
         ),
         host=args.host,
         port=args.port,
     )
+
+
+def _cuda():
+    try:
+        import torch
+    except ImportError:
+        return None
+    return torch.cuda if torch.cuda.is_available() else None
+
+
+def _snapshot_revision(checkpoint) -> str | None:
+    parts = Path(checkpoint).parts if checkpoint else ()
+    return parts[parts.index("snapshots") + 1] if "snapshots" in parts[:-1] else None
+
+
+def _weights_dtype(engine) -> str | None:
+    model = getattr(engine, "model", None)
+    if model is None:
+        return None
+    try:
+        return str(next(model.parameters()).dtype)
+    except (AttributeError, StopIteration, TypeError):
+        return None
+
+
+def cmd_presentation_checks(args: argparse.Namespace) -> None:
+    import time
+
+    from . import presentation
+    from .calibrate import CalibrationProfile
+    from .model import load
+
+    states = presentation.read_states(args.states)[: args.limit]
+    kinds = [k.strip() for k in args.kinds.split(",") if k.strip()]
+    max_rows = args.max_rows or presentation.MAX_ROWS
+    settings = {
+        "n_states": len(states),
+        "lang": args.lang,
+        "raw": args.raw,
+        "kinds": kinds,
+        "score_order_average": args.score_order_average,
+        "max_rows": max_rows,
+    }
+    saved = json.loads(Path(args.compare).read_text("utf-8")) if args.compare else None
+    _refuse_other_settings(saved, settings, presentation.PRE_LOAD)
+    engine = load(
+        args.checkpoint,
+        model_id=args.model,
+        cache_dir=args.model_cache,
+        calibration=args.calibration,
+        score_order_average=args.score_order_average,
+    )
+    if args.raw:
+        engine.calibration = CalibrationProfile()
+    settings["checkpoint_revision"] = _snapshot_revision(engine.checkpoint)
+    settings["dtype"] = _weights_dtype(engine)
+    _refuse_other_settings(saved, settings, presentation.POST_LOAD)
+    cuda = _cuda()
+    if cuda:
+        cuda.empty_cache()
+        cuda.reset_peak_memory_stats()
+    started = time.perf_counter()
+    answers = presentation.ask(engine, states, args.lang, kinds, max_rows)
+    seconds = time.perf_counter() - started
+    report = presentation.report(answers, args.lang, kinds, args.slot0_min)
+    packed = presentation.packed_consistency(
+        engine, states[: args.packed], answers, args.lang, kinds
+    )
+    peak = (
+        {
+            "allocated_gib": round(cuda.max_memory_allocated() / 2**30, 2),
+            "reserved_gib": round(cuda.max_memory_reserved() / 2**30, 2),
+        }
+        if cuda
+        else None
+    )
+    if cuda:
+        cuda.empty_cache()
+    print(presentation.to_markdown(report))
+    print(f"packed vs alone: max |dp| {packed:.2e} over {min(args.packed, len(states))} states")
+    payload = {
+        "checkpoint": args.checkpoint,
+        "states": args.states,
+        **settings,
+        "seconds": round(seconds, 1),
+        "peak_vram": peak,
+        "packed_max_abs_diff": packed,
+        "checks": report,
+    }
+    if args.out:
+        text = json.dumps(payload, indent=1, ensure_ascii=False) + "\n"
+        Path(args.out).write_text(text, "utf-8")
+    failures = []
+    if saved is not None:
+        failures += presentation.drift(report, saved["checks"], args.tolerance)
+    if args.enforce_gate:
+        failures += [
+            f"{kind}.{check}: {r[check]['metric']:+.3f} below {r[check]['gate']:+.2f}"
+            for kind, r in report.items()
+            for check in ("identical", "first_slot")
+            if not r[check]["passed"]
+        ]
+    if failures:
+        sys.exit("presentation checks failed:\n  " + "\n  ".join(failures))
+
+
+def _refuse_other_settings(saved: dict | None, settings: dict, keys) -> None:
+    from .presentation import settings_mismatch
+
+    differ = settings_mismatch(saved, settings, keys) if saved is not None else []
+    if differ:
+        print(
+            "presentation settings differ from the committed report: " + "; ".join(differ),
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -238,7 +361,7 @@ def main(argv: list[str] | None = None) -> None:
     route_parser = sub.add_parser("route", help="show the readout mode per question")
     route_parser.add_argument("request", help="path to a /v1/systemone request JSON")
     route_parser.add_argument("--model", default="Qwen/Qwen3.5-4B-Base")
-    # Defaults mirror `EngineConfig`, so the preview matches what a server does.
+    # Keep route-preview defaults aligned with EngineConfig.
     route_parser.add_argument(
         "--max-label-options",
         type=int,
@@ -294,11 +417,54 @@ def main(argv: list[str] | None = None) -> None:
         "--max-batch-tokens",
         type=int,
         default=16384,
-        help="padded tokens per batched forward across requests (default 16384)",
+        help="padded tokens per batched forward, and the most a request Score averaging grew "
+        "may need (default 16384)",
+    )
+    serve_parser.add_argument(
+        "--score-order-average",
+        choices=["off", "reversed", "cyclic"],
+        default="off",
+        help="average Score levels over reversed or all cyclic orders (2x / Kx rows; ADR-029)",
     )
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8000)
     serve_parser.set_defaults(func=cmd_serve)
+
+    presentation_parser = sub.add_parser(
+        "presentation-checks",
+        help="label-free position checks for Score and Choice (ADR-029)",
+    )
+    presentation_parser.add_argument("states", help="JSONL with a `state` per line")
+    presentation_parser.add_argument("--checkpoint", default=None)
+    presentation_parser.add_argument("--model", default="Qwen/Qwen3.5-4B-Base")
+    presentation_parser.add_argument("--model-cache", default=None)
+    presentation_parser.add_argument("--calibration", default=None)
+    presentation_parser.add_argument("--lang", choices=["en", "ja"], default="en")
+    presentation_parser.add_argument("--kinds", default="score,choice")
+    presentation_parser.add_argument("--limit", type=int, default=None)
+    presentation_parser.add_argument(
+        "--raw", action="store_true", help="score without calibration (T = 1 everywhere)"
+    )
+    presentation_parser.add_argument(
+        "--score-order-average", choices=["off", "reversed", "cyclic"], default="off"
+    )
+    presentation_parser.add_argument(
+        "--packed", type=int, default=3, help="states for the packed-vs-alone check"
+    )
+    presentation_parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+        help="batch rows per probe call, as the engine counts them (default 32)",
+    )
+    presentation_parser.add_argument("--slot0-min", type=float, default=-0.20)
+    presentation_parser.add_argument("--out", default=None, help="write the report JSON here")
+    presentation_parser.add_argument("--compare", default=None, help="a committed report JSON")
+    presentation_parser.add_argument("--tolerance", type=float, default=0.05)
+    presentation_parser.add_argument(
+        "--enforce-gate", action="store_true", help="also fail when a check is below its gate"
+    )
+    presentation_parser.set_defaults(func=cmd_presentation_checks)
 
     data_parser = sub.add_parser("data", help="build the training mixture and the eval set")
     data_sub = data_parser.add_subparsers(dest="data_command", required=True)

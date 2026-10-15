@@ -107,7 +107,7 @@ This is our plan's §14 ("encode the question, don't build per-question heads") 
 ### 3.6 Training objectives — from `NanoJev` and `decider`
 
 - NanoJev: CE / Brier / paired-proper-reward variants, with exact gradient checks.
-- decider: cross-entropy fine-tune with **random layout per example** and **abstain augmentation**; evaluation reports accuracy / NLL / Brier / ECE / AURC / selective accuracy per task; v10 adds **RL with a proper-score belief reward** — the open analogue of RLCD.
+- decider: cross-entropy fine-tune with **random layout per example** and **abstain augmentation**; evaluation reports accuracy / negative_log_likelihood / Brier / ECE / AURC / selective accuracy per task; v10 adds **RL with a proper-score belief reward** — the open analogue of RLCD.
 
 Supervised proper-scoring first, RL only after. That vindicates the plan's §17 ordering.
 
@@ -201,6 +201,8 @@ LoRA r32 on `q,k,v,o,gate,up,down` ≈ 25–40 M trainable parameters. **The Fam
 - they get **separate fitted temperatures** — one global scalar would be wrong for at least one of them;
 - on option sets where **both** are valid we measure agreement. Material disagreement means the router is a correctness hazard, not merely a capacity switch. This is an explicit eval, not an assumption.
 
+**Order averaging** (added in the build, not in the original design). Under Mode A with the state-first layout, Choice and binary Noul are read in their shown order and reversed, and the two distributions are averaged in canonical order (ADR-020). Score keeps its level order by default; `EngineConfig.score_order_average` opts it into the reversed order or every rotation, at 2x or Kx rows, and `order_average=False` reads every question once. A request that Score averaging grew is refused in `prepare`, before any GPU work, when its padded tokens pass `max_batch_tokens` (16384, the batcher's budget; the server passes its own value to the engine); one without averaged Score rows never is, since the batcher runs an oversized request alone (ADR-030). `lev presentation-checks` measures the position bias of one read, the bias averaging has to remove (ADR-029).
+
 ### 5.4 Output types
 
 | Type | Mode A | Mode B |
@@ -235,7 +237,7 @@ Three splits, not two. Temperature is fitted on a split disjoint from **both** t
 1. Train with a proper scoring rule (cross-entropy + Brier).
 2. **Abstain augmentation** (decider): examples where the answer is not determinable from the state, teaching the model to spread mass rather than guess confidently.
 3. Post-hoc temperature fit on the calibration split.
-4. Report accuracy, NLL, Brier and **ECE** per source, with and without the temperature.
+4. Report accuracy, negative_log_likelihood, Brier and **ECE** per source, with and without the temperature.
 
 Evidence this is worth the effort: the untuned Qwen3-8B (`qwen3-8b-full`) sits at **ECE 0.4252**; reflex, Qwen3.5-4B plus one fitted scalar, reaches **0.0849**. Jev is **0.0764**. **A single scalar is most of the gap.**
 

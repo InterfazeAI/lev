@@ -8,7 +8,10 @@ import time
 from collections.abc import Callable
 from dataclasses import fields
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import torch
 
 from ..prompt import Style
 from .checkpoints import (
@@ -26,19 +29,19 @@ HISTORY = "history.json"
 
 
 def build_model(config: TrainConfig, model_cache: str | None = None):
-    """Load the tokenizer and backbone, wrapped in LoRA when `config.use_lora`."""
     import torch
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_id, cache_dir=model_cache)
+    if tokenizer is None:
+        raise RuntimeError(f"could not load tokenizer for {config.model_id!r}")
     if tokenizer.pad_token_id is None:
-        # Rows are right-padded and `last_positions` comes from the attention mask,
-        # so the pad token only has to exist.
+        # Right padding uses mask-derived positions, so an existing token can serve as padding.
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # bfloat16 on CPU is glacial, and `make smoke-local` runs on a laptop.
+    # Use fp32 for CPU smoke runs.
     dtype = getattr(torch, config.dtype)
     if dtype is torch.bfloat16 and not torch.cuda.is_available():
         print("no CUDA; training in float32 instead of bfloat16")
@@ -48,8 +51,7 @@ def build_model(config: TrainConfig, model_cache: str | None = None):
     model: Any = AutoModelForCausalLM.from_pretrained(
         config.model_id,
         dtype=dtype,
-        # Multi-GPU only: on an Apple machine accelerate dispatches to MPS and
-        # the process dies with SIGSEGV part-way through loading.
+        # Restrict automatic device mapping to CUDA; MPS loading can crash.
         device_map="auto" if torch.cuda.device_count() > 1 else None,
         cache_dir=model_cache,
     )
@@ -58,8 +60,7 @@ def build_model(config: TrainConfig, model_cache: str | None = None):
 
     if config.gradient_checkpointing:
         model.gradient_checkpointing_enable()
-        # Without it, checkpointed activations have no grad_fn and the LoRA
-        # adapters get no gradient: a silent no-op run.
+        # Enable input gradients so checkpointing propagates gradients to LoRA adapters.
         model.enable_input_require_grads()
 
     if config.use_lora:
@@ -78,15 +79,15 @@ def build_model(config: TrainConfig, model_cache: str | None = None):
     return model, tokenizer
 
 
-def decision_loss(logits, targets, config: TrainConfig, ordinal=False, soft_targets=None):
-    """Cross-entropy, Brier and ordinal loss over padded candidate sets.
-
-    Args:
-        logits: `(B, K)`, with `-inf` at padded slots.
-        targets: `(B,)` gold indices; `IGNORE_INDEX` for abstain rows.
-        ordinal: `(B,)` bool for ordered targets, or a scalar bool.
-        soft_targets: `(B, K)` distributions for abstain rows.
-    """
+# logits (B, K), -inf at padded slots; targets (B,) gold indices, IGNORE_INDEX for abstain rows;
+# ordinal (B,) bool or a scalar bool; soft_targets (B, K) distributions for abstain rows.
+def decision_loss(
+    logits,
+    targets,
+    config: TrainConfig,
+    ordinal: bool | torch.Tensor = False,
+    soft_targets=None,
+):
     import torch
     import torch.nn.functional as F
 
@@ -102,8 +103,7 @@ def decision_loss(logits, targets, config: TrainConfig, ordinal=False, soft_targ
     if soft_targets is not None and (~hard).any():
         target_dist[~hard] = soft_targets[~hard].to(probs.dtype)
 
-    # `torch.where`, not a product: a padded slot has logit -inf and target 0, and
-    # `0 * -inf` is NaN, which poisons the batch mean.
+    # Use where to avoid NaN from padded slots with 0 * -inf.
     weighted = torch.where(target_dist > 0, target_dist * log_probs, torch.zeros_like(log_probs))
     ce = -weighted.sum(dim=-1).mean()
     brier = ((probs - target_dist) ** 2).sum(dim=-1).mean()
@@ -119,19 +119,14 @@ def decision_loss(logits, targets, config: TrainConfig, ordinal=False, soft_targ
     return loss
 
 
+# (B, K) scores: label logits in Mode A, pooled candidate embeddings in Mode B.
 def candidate_logits(model, batch, head=None):
-    """One forward pass -> `(B, K)` logits over the batch's candidate set.
-
-    Mode A gathers label-token logits at the answer boundary. Mode B scores pooled
-    candidate strings through the head: one extra short forward, not one per option.
-    """
     import torch
 
     from ..router import Mode
 
     if batch.mode is Mode.LABEL_TOKEN:
-        # Project only answer positions to avoid a full (B, seq, vocab) allocation.
-        # Rows with different answer positions must pick their own output column.
+        # Project answer positions only; each row selects its own output column.
         keep, column = torch.unique(batch.last_positions, return_inverse=True)
         out = model(
             input_ids=batch.input_ids,
@@ -163,18 +158,16 @@ def candidate_logits(model, batch, head=None):
 
         flat = batch.candidate_index.reshape(-1)
         reprs = candidate_repr[flat].view(*batch.candidate_index.shape, -1)  # (B, K, H)
-        # Cast hidden states up to the fp32 head. Casting to the bf16 activations'
-        # dtype instead raises on GPU, and is invisible on CPU, where both are fp32.
+        # Match hidden states to the fp32 head, not the bf16 backbone.
         target_dtype = next(head.parameters()).dtype
         logits = head(question_repr.to(target_dtype), reprs.to(target_dtype), batch.candidate_mask)
 
-    # Mode B already masks padded slots; Mode A's gather returns a real (wrong)
-    # vocabulary logit there.
+    # Mask Mode A padding after gathering vocabulary logits.
     return logits.float().masked_fill(batch.candidate_mask.to(logits.device), float("-inf"))
 
 
+# The head stays fp32 beside the bf16 backbone.
 def build_head(config: TrainConfig, model=None):
-    """The Mode B matching head, in fp32 beside the bf16 backbone."""
     import torch
 
     from ..readout.mode_b import CandidatePathReadout
@@ -186,6 +179,34 @@ def build_head(config: TrainConfig, model=None):
     if model is not None:
         head = head.to(device=device_of(model), dtype=torch.float32)
     return head
+
+
+def load_for_eval(config: TrainConfig, checkpoint_dir, model_cache: str | None = None):
+    model, tokenizer = build_model(config, model_cache)
+    head = build_head(config, model) if config.train_mode_b_head else None
+    load_checkpoint(model, head, checkpoint_dir)
+    model.eval()
+    if head is not None:
+        head.eval()
+    return model, tokenizer, head
+
+
+def scored_rows(model, tokenizer, head, config: TrainConfig, rows, batch_size):
+    import torch
+
+    routes = RouteCache(tokenizer, config.max_label_options, Style(config.prompt_style))
+    collator = DecisionCollator(tokenizer, max_seq_len=config.max_seq_len, routes=routes)
+    batcher = ModeBatcher(
+        tokenizer, batch_size=batch_size, bucket_window=config.bucket_window, routes=routes
+    )
+    device = device_of(model)
+    with torch.no_grad():
+        for group in batcher(rows):
+            batch = to_device(collator(group), device)
+            logits = candidate_logits(model, batch, head)
+            for i, example in enumerate(group):
+                width = int((~batch.candidate_mask[i]).sum())
+                yield example, logits[i, :width].tolist(), batch.mode.value, width
 
 
 def device_of(model):
@@ -202,8 +223,8 @@ def to_device(batch, device):
     return batch
 
 
+# Validate before loading the model, so bad data fails fast.
 def prepare_data(config: TrainConfig, data_dir: str):
-    """Validate data and contamination before loading the model."""
     from ..data.build import MANIFEST, load_split
     from ..data.splits import Split
 
@@ -218,8 +239,7 @@ def prepare_data(config: TrainConfig, data_dir: str):
     if not train:
         raise ValueError(f"{root / 'train.jsonl'} is empty")
 
-    # Repeats the contamination guard on the manifest's Hub ids: the only check
-    # that sees a manifest edited after the build. Skipped without a manifest.
+    # Recheck manifest Hub ids in case the manifest changed after data assembly.
     manifest_path = root / MANIFEST
     if manifest_path.is_file():
         from ..data.contamination import assert_clean
@@ -240,19 +260,12 @@ def run_training(
     max_steps: int | None = None,
     fresh: bool = False,
 ) -> dict:
-    """Train, checkpointing periodically so a long run survives a preemption.
-
-    With no `resume_from`, the newest `step-N` under `config.output_dir` is resumed;
-    `fresh=True` starts over. Resume restores optimiser, schedule and data order, so a
-    finished run trains nothing; pre-ADR-021 checkpoints restore weights only.
-    """
     import torch
     from torch.optim import AdamW
     from transformers import get_cosine_schedule_with_warmup
 
     config.validate()
 
-    # Everything cheap and fallible happens before the model is touched.
     data = prepare_data(config, data_dir)
     output = Path(config.output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -260,8 +273,7 @@ def run_training(
     if resume_from is None and not fresh and (found := latest_checkpoint(output)) is not None:
         resume_from = str(found)
         print(f"resuming from {found} (pass --fresh to start over)", flush=True)
-    # Move, not delete, the previous run, so auto-resume (highest step) and the
-    # calibration lookup cannot pick it up.
+    # Preserve the previous run outside active resume and calibration lookups.
     if fresh and (moved := set_aside_previous_run(output)) is not None:
         print(f"previous run moved to {moved}", flush=True)
 
@@ -291,8 +303,7 @@ def run_training(
     train = data["train"]
     steps_per_epoch = max(1, len(train) // config.examples_per_step)
     total_steps = max_steps or steps_per_epoch * config.epochs
-    # Sized in optimiser steps: sized in micro-steps, the cosine would finish
-    # `grad_accum` times early and the tail would train at a learning rate of 0.
+    # Size the schedule in optimizer steps so accumulation does not finish it early.
     optimiser_steps = max(1, total_steps // config.grad_accum)
     scheduler = get_cosine_schedule_with_warmup(
         optimiser, int(optimiser_steps * config.warmup_ratio), optimiser_steps
@@ -331,8 +342,7 @@ def run_training(
     model.train()
 
     def training_state() -> dict:
-        # Read at save time: the loop below rebinds `epoch`, `step_in_epoch` and
-        # `rng_before_epoch`, and every save happens after at least one step.
+        # Read loop position and RNG state at save time, after they are updated.
         return {
             "step": step,
             "epoch": epoch,
@@ -348,7 +358,6 @@ def run_training(
         # Before the shuffle, so a resumed run reproduces this epoch's order.
         rng_before_epoch = rng.getstate()
         order = list(train)
-        # Shuffled before bucketing so windows differ per epoch.
         rng.shuffle(order)
         groups = batcher(order, epoch=epoch)
         step_in_epoch = 0
@@ -388,7 +397,7 @@ def run_training(
                 step,
                 value,
                 batch.mode.value,
-                scheduler.get_last_lr()[0],
+                float(scheduler.get_last_lr()[0]),
                 tokens=int(batch.attention_mask.sum()),
             )
             step += 1
@@ -405,7 +414,7 @@ def run_training(
                     state=training_state(),
                 )
                 last_saved = step
-                # So a run that dies late still leaves its loss curve.
+                # Persist history periodically to survive late preemption.
                 _write_history(output, history, step)
             if step >= total_steps:
                 break
@@ -424,10 +433,6 @@ def run_training(
 
 
 def set_aside_previous_run(output: Path) -> Path | None:
-    """Move prior checkpoints, history and calibration under `superseded-<utc>`.
-
-    Return the directory, or None if there was nothing to move.
-    """
     stale = list(output.glob("step-*")) + [
         output / name for name in (HISTORY, CALIBRATION) if (output / name).exists()
     ]

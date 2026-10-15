@@ -1,9 +1,4 @@
-"""Accuracy and calibration over typed answer distributions.
-
-ECE uses top probability, since servers define their `confidence` fields
-differently (lev: normalized Gini; Jev: chance-corrected max probability). Noul
-is represented as {True: p, False: 1-p} for every backend.
-"""
+"""Score typed distributions; ECE uses top probability, independent of vendor confidence."""
 
 from __future__ import annotations
 
@@ -11,8 +6,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
-# Log clamp, so a confidently wrong answer scores badly rather than infinitely
-# badly (the scikit-learn convention).
+# Clamp zero probabilities so confidently wrong answers have finite log loss.
 _EPS = 1e-15
 
 
@@ -28,14 +22,13 @@ def to_distribution(answer: Any) -> dict[Any, float]:
     raise ValueError(f"Unknown answer type {kind!r}")
 
 
+# Choice uses the model's own pick rather than the argmax.
 def predicted_label(answer: Any) -> Any:
-    """The argmax label, except for Choice, which uses the model's own pick."""
     kind = answer.type
     if kind == "noul":
         return float(answer.noul) >= 0.5
     if kind == "choice":
-        # Not a recomputed argmax: they differ on ties, and `choice` is what a
-        # caller acts on.
+        # Preserve the model's choice, including its tie-breaking behavior.
         return answer.choice
     if kind == "score":
         return max(answer.probabilities.items(), key=lambda kv: kv[1])[0]
@@ -43,7 +36,6 @@ def predicted_label(answer: Any) -> Any:
 
 
 def top_probability(answer: Any) -> float:
-    """The most likely label's probability (max(p, 1-p) for a Noul): what ECE bins on."""
     return max(to_distribution(answer).values())
 
 
@@ -51,8 +43,8 @@ def log_loss(dist: dict[Any, float], truth: Any) -> float:
     return -math.log(max(dist.get(truth, 0.0), _EPS))
 
 
+# Multiclass Brier: squared error summed over the whole vector.
 def brier(dist: dict[Any, float], truth: Any) -> float:
-    """Multiclass Brier score: summed squared error over the whole vector."""
     labels = set(dist) | {truth}
     return sum((dist.get(k, 0.0) - (1.0 if k == truth else 0.0)) ** 2 for k in labels)
 
@@ -73,9 +65,9 @@ class Bin:
     def mean_confidence(self) -> float:
         return self.conf_sum / self.n if self.n else 0.0
 
+    # Signed: positive means overconfident.
     @property
     def gap(self) -> float:
-        """Signed: positive means overconfident."""
         return self.mean_confidence - self.accuracy
 
 
@@ -101,7 +93,6 @@ class Calibration:
 
     @property
     def ece(self) -> float:
-        """Expected Calibration Error: sample-weighted mean absolute bin gap."""
         if not self.n:
             return 0.0
         return sum(b.n * abs(b.gap) for b in self.bins) / self.n
@@ -110,7 +101,6 @@ class Calibration:
 def calibration(
     records: list[tuple[dict[Any, float], Any, Any, float]], n_bins: int = 10
 ) -> Calibration:
-    """Aggregate metrics over (distribution, predicted, truth, confidence) rows."""
     edges = [i / n_bins for i in range(n_bins + 1)]
     cal = Calibration(bins=[Bin(edges[i], edges[i + 1]) for i in range(n_bins)])
 
@@ -134,10 +124,8 @@ def calibration(
 def selective_accuracy(
     records: list[tuple[dict[Any, float], Any, Any, float]], threshold: float
 ) -> tuple[float, float]:
-    """Accuracy on answers at or above a confidence threshold, plus the kept fraction;
-    if accuracy does not rise with the threshold, confidence is useless for routing."""
     kept = [r for r in records if r[3] >= threshold]
     if not kept:
         return 0.0, 0.0
-    acc = sum(1 for _, pred, truth, _ in kept if pred == truth) / len(kept)
+    acc = sum(pred == truth for _, pred, truth, _ in kept) / len(kept)
     return acc, len(kept) / len(records)

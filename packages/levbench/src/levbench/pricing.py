@@ -1,9 +1,4 @@
-"""Per-million-token prices, and cost accounting for a single call.
-
-Jev prices are from typesafe.ai (input $0.042/M, output free). Anthropic prices
-are first-party API rates. Both are vendor list prices and go stale -- override
-via `PRICES` rather than editing call sites.
-"""
+"""Compute call costs from per-million-token list prices; override rates via PRICES."""
 
 from __future__ import annotations
 
@@ -16,9 +11,10 @@ class Price:
     output_per_mtok: float
 
 
+# Every Jev version bills at the published Jev rate unless PRICES names it.
+JEV = Price(0.042, 0.0)
+
 PRICES: dict[str, Price] = {
-    "jev-latest": Price(0.042, 0.0),
-    "jev-1.13": Price(0.042, 0.0),
     "claude-opus-5": Price(5.00, 25.00),
     "claude-sonnet-5": Price(2.00, 10.00),
     "claude-haiku-4-5": Price(1.00, 5.00),
@@ -26,9 +22,7 @@ PRICES: dict[str, Price] = {
 }
 
 
-# A self-hosted model costs GPU time, not tokens. An unlisted `jev*` name is
-# priced as jev-latest; any other unlisted name, including an unlisted
-# `claude-*`, counts as self-hosted and costs $0.
+# Unknown non-Jev models are self-hosted and have zero token cost.
 SELF_HOSTED = Price(0.0, 0.0)
 
 
@@ -40,7 +34,7 @@ def lookup(model: str) -> Price:
     if model in PRICES:
         return PRICES[model]
     if model.startswith("jev"):
-        return PRICES["jev-latest"]
+        return JEV
     return SELF_HOSTED
 
 

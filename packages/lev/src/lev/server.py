@@ -1,19 +1,16 @@
-"""FastAPI endpoints for typed decisions and model health.
-
-Status codes: 422 malformed, 529 still loading, 503 past `max_pending` in flight
-or worker stopped, 504 queued past `timeout`.
-"""
+"""Serve typed decisions and health; return 422, 529, 503, or 504 for request failures."""
 
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 # Module level: FastAPI resolves the endpoint's string annotations here.
 from fastapi import Request
 
 from .batcher import Batcher, ClientGone, Overloaded, WorkerStopped
-from .model import load
+from .model import MAX_BATCH_TOKENS, load
 from .types import SystemOneRequest, SystemOneResponse
 
 
@@ -28,19 +25,19 @@ def create_app(
     prompt_style: Literal["plain", "chat"] | None = None,
     skip_multi_token_codes: bool = True,
     max_pending: int = 64,
-    max_batch_tokens: int = 16384,
+    max_batch_tokens: int = MAX_BATCH_TOKENS,
     timeout: float = 30.0,
+    score_order_average: Literal["off", "reversed", "cyclic"] = "off",
 ) -> Any:
     from fastapi import FastAPI, HTTPException, Response
     from starlette.concurrency import run_in_threadpool
 
     from . import __version__
 
-    app = FastAPI(title="lev", version=__version__)
     state: dict[str, Any] = {"engine": None, "batcher": None}
 
-    @app.on_event("startup")
-    def _load() -> None:
+    @asynccontextmanager
+    async def lifespan(app):
         engine = load(
             checkpoint_dir,
             model_id=model_id,
@@ -51,11 +48,16 @@ def create_app(
             compile=compile,
             max_label_options=max_label_options,
             skip_multi_token_codes=skip_multi_token_codes,
+            score_order_average=score_order_average,
+            max_batch_tokens=max_batch_tokens,
         )
         state["batcher"] = Batcher(
             engine, max_pending=max_pending, max_batch_tokens=max_batch_tokens, timeout=timeout
         )
         state["engine"] = engine
+        yield
+
+    app = FastAPI(title="lev", version=__version__, lifespan=lifespan)
 
     # Async, so a saturated thread pool cannot starve it.
     @app.get("/health")
@@ -73,6 +75,8 @@ def create_app(
             "noul_readout": config.noul_readout,
             "max_label_options": config.max_label_options,
             "order_average": config.order_average,
+            "score_order_average": config.score_order_average,
+            "max_batch_tokens": config.max_batch_tokens,
             "prefix_mode": config.prefix_mode,
             "compiled": config.compile,
             "prompt_style": config.prompt_style,
@@ -107,8 +111,6 @@ def create_app(
 
 
 async def _disconnected(request: Request) -> None:
-    """Return when the client hangs up. With the body read, the next ASGI message is
-    the disconnect; any other means none is reported, so wait forever, not spin."""
     if (await request.receive())["type"] == "http.disconnect":
         return
     await asyncio.Event().wait()

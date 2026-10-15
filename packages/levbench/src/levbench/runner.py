@@ -1,21 +1,18 @@
-"""Backend-agnostic evaluation runner.
-
-Every backend exposes the same `system_one(state, questions)` call and answer
-types, so the benchmark is written once and only the client changes.
-"""
+"""Evaluate backends through the shared system_one interface."""
 
 from __future__ import annotations
 
 import os
 import statistics
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from dotenv import load_dotenv
 
 from . import metrics, pricing
-from .tasks import Item
+from .tasks import FileItem, Item
 
 load_dotenv()
 
@@ -27,8 +24,7 @@ class CallResult:
     served_by: str
     input_tokens: int
     output_tokens: int
-    # Adapter-only retries (schema-invalid LLM output, transient provider errors);
-    # always 0 on the TypeSafe SDK, where schema conformance is structural.
+    # Adapter retries; the TypeSafe SDK reports zero.
     schema_retries: int = 0
     transient_retries: int = 0
 
@@ -73,6 +69,8 @@ class EvalReport:
 
 
 DEFAULT_LOCAL_BASE_URL = "http://localhost:8000"
+# Label for Jev runs left on the SDK's default model; reports name the version served instead.
+JEV_DEFAULT = "jev"
 
 
 # Modal's 4B cold start measured 20-55 s, against the SDK's 10 s default (ADR-022).
@@ -85,26 +83,20 @@ def build_client(
     base_url: str | None = None,
     timeout: float | None = None,
 ):
-    """Return `(client, model_name)` for jev, lev or anthropic.
-
-    Jev and lev share the TypeSafe protocol. lev defaults to localhost, needs no
-    credential and uses self-hosted pricing. Anthropic uses the LLM adapter.
-    """
     if backend in ("jev", "lev"):
         if backend == "lev":
             base_url = base_url or DEFAULT_LOCAL_BASE_URL
         from typesafe_sdk import TypeSafeClient
 
-        resolved = model or ("jev-latest" if backend == "jev" else "local")
-        kwargs: dict[str, Any] = {"model": resolved}
+        resolved = model or (JEV_DEFAULT if backend == "jev" else "local")
+        kwargs: dict[str, Any] = {"model": None if resolved == JEV_DEFAULT else resolved}
         if timeout is not None:
             kwargs["timeout"] = timeout
         elif backend == "lev":
             kwargs["timeout"] = DEFAULT_LOCAL_TIMEOUT
         if base_url:
             kwargs["base_url"] = base_url
-            # Never forward the hosted API key to a custom endpoint. Empty local
-            # keys also fall back, since an empty Bearer header is invalid.
+            # Use local credentials for custom endpoints; empty keys produce invalid Bearer headers.
             kwargs["api_key"] = os.environ.get("LEVBENCH_LOCAL_API_KEY") or "local"
         return TypeSafeClient(**kwargs), resolved
 
@@ -125,9 +117,8 @@ def build_client(
     raise ValueError(f"Unknown backend {backend!r} (expected 'jev', 'lev' or 'anthropic')")
 
 
+# Billed retry totals win; zero counts are accepted, missing counts raise.
 def _token_count(usage: Any, total_field: str, base_field: str) -> int:
-    """Prefer the adapter's `*_total` (it includes billed retries) over the SDK's base
-    field; a genuine 0 counts, but an absent count raises rather than booking it free."""
     for field_name in (total_field, base_field):
         value = getattr(usage, field_name, None)
         if value is not None:
@@ -167,12 +158,10 @@ def run_eval(
     client,
     backend: str,
     model: str,
-    items: list[Item],
+    items: Sequence[Item | FileItem],
     questions: dict[str, Any],
     concurrency: int = 1,
 ) -> EvalReport:
-    """Score every item, with up to `concurrency` requests in flight and results in
-    item order; concurrency lowers wall time, not the per-call latency reported."""
     from concurrent.futures import ThreadPoolExecutor
 
     report = EvalReport(backend=backend, model=model)
@@ -188,19 +177,21 @@ def run_eval(
 
     for item, result in zip(items, results, strict=True):
         report.calls.append(result)
+        labels = item.labels
         for name, answer in result.answers.items():
-            truth = item.labels[name]
+            truth = labels[name]
+            distribution = metrics.to_distribution(answer)
             records[name].append(
                 (
-                    metrics.to_distribution(answer),
+                    distribution,
                     metrics.predicted_label(answer),
                     truth,
-                    metrics.top_probability(answer),
+                    max(distribution.values()),
                 )
             )
 
     served = report.served_by
-    if backend == "lev" and len(served) == 1:
+    if (backend == "lev" or model == JEV_DEFAULT) and len(served) == 1:
         # The label was a placeholder; the server knows what it loaded.
         report.model = served.pop()
 
@@ -221,30 +212,29 @@ def _format_summary(report: EvalReport) -> list[str]:
         lines.append(
             f"{'wall time':<18} {report.wall_seconds:.1f}s  ({n / report.wall_seconds:.2f} items/s)"
         )
-    lines.append(f"calls              {n}")
+    lines.append(f"{'calls':<18} {n}")
     if n:
-        lines.append(f"latency p50        {report.pct(0.5):.3f}s")
-        lines.append(f"latency mean       {statistics.mean(report.latencies):.3f}s")
-        # Under 100 calls the p95 falls among the few slowest calls, which are
-        # mostly connection setup; report the slowest call instead.
+        lines.append(f"{'latency p50':<18} {report.pct(0.5):.3f}s")
+        lines.append(f"{'latency mean':<18} {statistics.mean(report.latencies):.3f}s")
+        # Report the maximum for small samples, where p95 is dominated by connection setup.
         if n >= 100:
-            lines.append(f"latency p95        {report.pct(0.95):.3f}s")
+            lines.append(f"{'latency p95':<18} {report.pct(0.95):.3f}s")
         else:
             lines.append(
-                f"latency slowest    {report.latencies[-1]:.3f}s  (n={n}; too few for a p95)"
+                f"{'latency slowest':<18} {report.latencies[-1]:.3f}s  (n={n}; too few for a p95)"
             )
-    lines.append(f"input tokens       {sum(call.input_tokens for call in report.calls):,}")
-    lines.append(f"output tokens      {sum(call.output_tokens for call in report.calls):,}")
+    lines.append(f"{'input tokens':<18} {sum(call.input_tokens for call in report.calls):,}")
+    lines.append(f"{'output tokens':<18} {sum(call.output_tokens for call in report.calls):,}")
     if pricing.is_self_hosted(report.model):
-        lines.append("total cost         self-hosted (GPU time, not per-token)")
+        lines.append(f"{'total cost':<18} self-hosted (GPU time, not per-token)")
     else:
-        lines.append(f"total cost         ${report.total_cost:.6f}")
-    lines.append(f"schema retries     {report.total_schema_retries}")
-    lines.append(f"transient retries  {report.total_transient_retries}")
+        lines.append(f"{'total cost':<18} ${report.total_cost:.6f}")
+    lines.append(f"{'schema retries':<18} {report.total_schema_retries}")
+    lines.append(f"{'transient retries':<18} {report.total_transient_retries}")
     served = report.served_by
     if served and served != {report.model} and not pricing.is_self_hosted(report.model):
         lines.append(
-            f"WARNING            requested {report.model!r} but server served "
+            f"{'WARNING':<18} requested {report.model!r} but server served "
             f"{sorted(served)} -- cost figures use the requested model's price"
         )
     lines.append("")

@@ -1,4 +1,4 @@
-"""Qwen3.5's `LinearAttentionLayer` has no `batch_repeat_interleave`; a fork built on it raised."""
+"""Test prefix-cache copying with mixed full- and linear-attention layers."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from lev.model import _fork  # noqa: E402
 BATCH, HEADS, SEQ, DIM = 1, 2, 5, 4
 
 
+# Shaped like Qwen3.5's cache: full-attention and linear layers mixed.
 def hybrid_cache():
-    """A cache shaped like Qwen3.5's: full-attention and linear layers mixed."""
     full = cache_utils.DynamicLayer()
     full.update(torch.randn(BATCH, HEADS, SEQ, DIM), torch.randn(BATCH, HEADS, SEQ, DIM))
 
@@ -51,7 +51,6 @@ def test_every_forked_row_is_a_copy_of_row_zero():
 
 
 def test_fork_does_not_mutate_the_source():
-    """The prefix cache must stay reusable for the next request."""
     original = hybrid_cache()
     before_keys = original.layers[0].keys.clone()
     before_conv = original.layers[1].conv_states[0].clone()
@@ -63,8 +62,8 @@ def test_fork_does_not_mutate_the_source():
     assert torch.equal(original.layers[1].conv_states[0], before_conv)
 
 
+# Hybrid caches do not support batch_repeat_interleave.
 def test_the_old_approach_still_fails():
-    """Pins why `_fork` avoids `batch_repeat_interleave`, so nobody 'simplifies' it back."""
     linear = cache_utils.LinearAttentionLayer()
     assert not hasattr(linear, "batch_repeat_interleave"), (
         "LinearAttentionLayer now implements batch_repeat_interleave; "

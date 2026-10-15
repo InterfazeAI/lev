@@ -1,4 +1,4 @@
-"""The guard must catch aliases, not just exact names, and must raise not warn."""
+"""Test blocked dataset names, aliases, and re-hosts."""
 
 from __future__ import annotations
 
@@ -72,9 +72,8 @@ class TestResolution:
     def test_innocent_datasets_pass(self, innocent):
         assert resolve(innocent) is None
 
+    # Includes subsets absent from the completed runs.
     def test_subsets_that_did_not_run_are_blocked_too(self):
-        """The 7 subsets `s1-fast` skipped are still evaluation data: easy to
-        forget, since the completed-run leaderboard never mentions them."""
         unrun = [
             "massive-de-DE",
             "squad2",

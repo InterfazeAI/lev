@@ -1,4 +1,4 @@
-"""End-to-end plumbing check against the fake transport. No API key needed."""
+"""Offline checks for benchmark metrics, SDK plumbing, and reporting. No API key needed."""
 
 from __future__ import annotations
 
@@ -6,23 +6,19 @@ import hashlib
 import json
 import math
 import random
-import sys
 from pathlib import Path
 from threading import Barrier
 from types import SimpleNamespace
 
-PKG = Path(__file__).resolve().parents[1]
-ROOT = next(p for p in PKG.parents if (p / "data").is_dir())
-sys.path.insert(0, str(PKG / "src"))
-sys.path.insert(0, str(PKG / "tests"))
+import httpx2
+import pytest
+from fake_transport import JEV_VERSION, transport
+from levbench import batching, confidence_id, metrics, runner
+from levbench.pricing import cost_usd
+from levbench.tasks import FileItem, dataset, detectable_difference, load_task_file
+from typesafe_sdk import Choice, Noul, TypeSafeClient
 
-import httpx2  # noqa: E402
-import pytest  # noqa: E402
-from fake_transport import transport  # noqa: E402
-from levbench import batching, confidence_id, metrics, runner  # noqa: E402
-from levbench.pricing import cost_usd  # noqa: E402
-from levbench.tasks import FileItem, dataset, detectable_difference, load_task_file  # noqa: E402
-from typesafe_sdk import Choice, Noul, TypeSafeClient  # noqa: E402
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / "data").is_dir())
 
 
 def fake_client() -> TypeSafeClient:
@@ -31,51 +27,47 @@ def fake_client() -> TypeSafeClient:
 
 def test_metrics_are_arithmetically_right() -> None:
     dist = {"a": 0.7, "b": 0.2, "c": 0.1}
-    assert abs(metrics.log_loss(dist, "a") - (-math.log(0.7))) < 1e-12
+    assert metrics.log_loss(dist, "a") == pytest.approx(-math.log(0.7), abs=1e-12, rel=0)
     # Brier: (0.7-1)^2 + 0.2^2 + 0.1^2 = 0.09 + 0.04 + 0.01
-    assert abs(metrics.brier(dist, "a") - 0.14) < 1e-12
+    assert metrics.brier(dist, "a") == pytest.approx(0.14, abs=1e-12, rel=0)
 
     # A perfectly calibrated set: 70% confident, 70% accurate -> ECE 0.
     recs = [({True: 0.7, False: 0.3}, True, True, 0.7)] * 7
     recs += [({True: 0.7, False: 0.3}, True, False, 0.7)] * 3
     cal = metrics.calibration(recs)
-    assert abs(cal.accuracy - 0.7) < 1e-12
+    assert cal.accuracy == pytest.approx(0.7, abs=1e-12, rel=0)
     assert cal.ece < 1e-12, f"expected zero ECE, got {cal.ece}"
 
     # A badly overconfident set: 100% confident, 50% accurate -> ECE 0.5.
     bad = [({True: 1.0, False: 0.0}, True, True, 1.0)] * 5
     bad += [({True: 1.0, False: 0.0}, True, False, 1.0)] * 5
-    assert abs(metrics.calibration(bad).ece - 0.5) < 1e-12
+    assert metrics.calibration(bad).ece == pytest.approx(0.5, abs=1e-12, rel=0)
 
 
 def test_every_primitive_flattens_to_a_distribution() -> None:
-    """Every primitive must flatten, including the fieldless Noul."""
     items, questions = dataset()
     result = runner.call_once(fake_client(), items[0].state, questions)
 
     noul = result.answers["is_urgent"]
-    assert not hasattr(noul, "confidence") or noul.confidence is None
+    assert getattr(noul, "confidence", None) is None
     dist = metrics.to_distribution(noul)
-    assert abs(sum(dist.values()) - 1.0) < 1e-9
+    assert sum(dist.values()) == pytest.approx(1.0, abs=1e-9, rel=0)
     assert metrics.top_probability(noul) == max(dist.values())
 
     choice = result.answers["department"]
     assert metrics.predicted_label(choice) == choice.choice
-    assert abs(sum(metrics.to_distribution(choice).values()) - 1.0) < 1e-3
+    assert sum(metrics.to_distribution(choice).values()) == pytest.approx(1.0, abs=1e-3, rel=0)
 
     score = result.answers["frustration"]
     by_level = metrics.to_distribution(score)
     expected = sum(level * p for level, p in by_level.items())
-    assert abs(score.score - expected) < 1e-2, "score must equal the probability-weighted mean"
+    assert score.score == pytest.approx(expected, abs=1e-2, rel=0)
 
 
+# Vendor confidence formulas differ, so ECE must use the answer's top probability.
 def test_ece_bins_on_the_top_probability_not_the_vendor_confidence_field() -> None:
-    """lev's `confidence` is Gini concentration and Jev's is chance-corrected max
-    probability, so ECE bins on the answer's own top probability instead."""
-
     class Server:
         def system_one(self, state, questions):
-            # 90% on the right answer, but a vendor confidence of 0.2.
             answer = SimpleNamespace(
                 type="choice", choice="a", probabilities={"a": 0.9, "b": 0.1}, confidence=0.2
             )
@@ -88,13 +80,13 @@ def test_ece_bins_on_the_top_probability_not_the_vendor_confidence_field() -> No
     items = [FileItem(f"s{i}", {"q": "a" if i < 9 else "b"}) for i in range(10)]
     questions = {"q": Choice(instructions="?", criteria={"a": None, "b": None})}
     report = runner.run_eval(Server(), "lev", "stub", items, questions)
-    # Every answer is 0.9 confident and 9 of 10 are right: perfectly calibrated.
+    # Top probability is 0.9 and 9 of 10 predictions are correct: ECE is zero.
     assert report.per_question["q"].ece == pytest.approx(0.0, abs=1e-9)
 
 
 def test_eval_runs_end_to_end_over_the_built_in_fixture() -> None:
     items, questions = dataset()
-    report = runner.run_eval(fake_client(), "jev", "jev-latest", items, questions)
+    report = runner.run_eval(fake_client(), "jev", runner.JEV_DEFAULT, items, questions)
     assert len(report.calls) == len(items)
     assert set(report.per_question) == set(questions)
     assert report.total_cost > 0
@@ -102,13 +94,12 @@ def test_eval_runs_end_to_end_over_the_built_in_fixture() -> None:
     assert "accuracy" in text and "ECE" in text
 
 
+# Synthetic billing checks the sweep arithmetic; live billing needs a live sweep.
 def test_sweep_arithmetic_over_a_fixed_billing_shape() -> None:
-    """SweepRow arithmetic over the fake transport's per-request billing, not
-    Jev's real billing, which only a live `levbench sweep` can measure."""
     state = (ROOT / "data" / "sample_policy.md").read_text()
-    rows = batching.sweep(fake_client(), "jev-latest", state, [1, 2, 4, 8, 13])
+    rows = batching.sweep(fake_client(), runner.JEV_DEFAULT, state, [1, 2, 4, 8, 13])
 
-    assert abs(rows[0].cost_ratio - 1.0) < 0.01, (
+    assert rows[0].cost_ratio == pytest.approx(1.0, abs=0.01, rel=0), (
         "at N=1 batched and split are the same call; ratio must be ~1"
     )
     ratios = [r.cost_ratio for r in rows]
@@ -116,54 +107,55 @@ def test_sweep_arithmetic_over_a_fixed_billing_shape() -> None:
     assert rows[-1].cost_ratio > 5, (
         f"at N=13 expected a large saving, got {rows[-1].cost_ratio:.1f}x"
     )
-    assert "batching sweep" in batching.format_sweep(rows, "jev-latest", len(state))
+    assert "batching sweep" in batching.format_sweep(rows, runner.JEV_DEFAULT, len(state))
 
 
-def test_confidence_identifier_recovers_a_planted_formula() -> None:
-    """If planted formulas were not identified uniquely, a match against a real server
-    would prove nothing."""
+@pytest.mark.parametrize("count", [0, -1])
+def test_sweep_rejects_non_positive_question_counts(count) -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        batching.sweep(None, runner.JEV_DEFAULT, "state", [count])
 
-    def server(conf_fn):
-        def handle(request):
-            body = json.loads(request.content)
-            answers = {}
-            for key, question in body["questions"].items():
-                options = list(question["criteria"])
-                # Varied, non-uniform distributions, so candidate statistics
-                # actually separate instead of coinciding.
-                raw = [1 + hashlib.sha256(f"{key}:{o}".encode()).digest()[0] % 97 for o in options]
-                total = sum(raw)
-                probs = {o: r / total for o, r in zip(options, raw, strict=True)}
-                answers[key] = {
-                    "type": "choice",
-                    "choice": max(probs, key=probs.get),
-                    "probabilities": probs,
-                    "confidence": conf_fn(list(probs.values())),
-                }
-            return httpx2.Response(
-                200,
-                json={
-                    "model": "planted",
-                    "answers": answers,
-                    "usage": {"input_tokens": 10, "output_tokens": 0},
-                },
-            )
 
-        return TypeSafeClient(api_key="x", model="planted", transport=httpx2.MockTransport(handle))
+def test_sweep_respects_an_explicitly_empty_bank() -> None:
+    with pytest.raises(ValueError, match="bank holds 0"):
+        batching.sweep(None, runner.JEV_DEFAULT, "state", [1], bank=[])
 
+
+# A match only means something if the identifier can tell candidate formulas apart.
+@pytest.mark.parametrize("planted", confidence_id.CANDIDATES)
+def test_confidence_identifier_recovers_a_planted_formula(planted) -> None:
+    def handle(request):
+        body = json.loads(request.content)
+        answers = {}
+        for key, question in body["questions"].items():
+            options = list(question["criteria"])
+            # Non-uniform distributions keep candidate statistics distinguishable.
+            raw = [1 + hashlib.sha256(f"{key}:{o}".encode()).digest()[0] % 97 for o in options]
+            total = sum(raw)
+            probs = {o: r / total for o, r in zip(options, raw, strict=True)}
+            answers[key] = {
+                "type": "choice",
+                "choice": max(probs, key=probs.__getitem__),
+                "probabilities": probs,
+                "confidence": confidence_id.CANDIDATES[planted](list(probs.values())),
+            }
+        return httpx2.Response(
+            200,
+            json={
+                "model": "planted",
+                "answers": answers,
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+            },
+        )
+
+    client = TypeSafeClient(api_key="x", model="planted", transport=httpx2.MockTransport(handle))
     questions = {
         f"q{i}": Choice(instructions="pick", criteria={c: c for c in "abcde"[: 2 + i % 4]})
         for i in range(6)
     }
-
-    for planted, fn in confidence_id.CANDIDATES.items():
-        client = server(fn)
-        answers = []
-        for state in ("alpha", "beta", "gamma", "delta"):
-            answers.extend(runner.call_once(client, state, questions).answers.values())
-        fits = confidence_id.identify(confidence_id.collect(answers))
-        winners = [f.name for f in fits if f.matches]
-        assert winners == [planted], f"planted {planted}, identified {winners}"
+    answers = list(runner.call_once(client, "state", questions).answers.values())
+    fits = confidence_id.identify(confidence_id.collect(answers))
+    assert [f.name for f in fits if f.matches] == [planted]
 
 
 def test_base_url_routes_to_a_local_clone() -> None:
@@ -191,23 +183,37 @@ def test_base_url_routes_to_a_local_clone() -> None:
 
 
 def test_local_base_url_never_forwards_the_real_key(monkeypatch) -> None:
-    """A `--base-url` server must not receive TYPESAFE_API_KEY (the SDK always
-    sends `Authorization: Bearer <key>`); the hosted path still authenticates."""
     monkeypatch.setenv("TYPESAFE_API_KEY", "sk-REAL-SECRET-KEY")
     monkeypatch.delenv("LEVBENCH_LOCAL_API_KEY", raising=False)
     local, _ = runner.build_client("jev", "litjev", "http://127.0.0.1:8000")
+    assert isinstance(local, TypeSafeClient)
     assert "REAL-SECRET" not in str(local._config.api_key), "leaked the real key"
     assert local._config.api_key == "local"
 
-    hosted, _ = runner.build_client("jev", "jev-latest")
+    hosted, _ = runner.build_client("jev")
+    assert isinstance(hosted, TypeSafeClient)
     assert hosted._config.api_key == "sk-REAL-SECRET-KEY", "hosted path lost its key"
 
 
+def test_an_unpinned_jev_client_takes_the_sdk_default(monkeypatch) -> None:
+    monkeypatch.setenv("TYPESAFE_API_KEY", "sk-test")
+    monkeypatch.setenv("TYPESAFE_DEFAULT_MODEL", "jev-1.12")
+    client, label = runner.build_client("jev")
+    assert label == runner.JEV_DEFAULT
+    assert client._config.default_model == "jev-1.12"
+
+
+def test_an_unpinned_jev_run_reports_the_version_served() -> None:
+    items, questions = dataset()
+    report = runner.run_eval(fake_client(), "jev", runner.JEV_DEFAULT, items, questions)
+    assert report.model == JEV_VERSION
+    assert "WARNING" not in runner.format_report(report)
+
+
 def test_empty_local_key_env_var_falls_back(monkeypatch) -> None:
-    """`LEVBENCH_LOCAL_API_KEY=` (from `.env.example`) once reached the SDK as "", which
-    sends a malformed `Bearer ` header (`LocalProtocolError: Illegal header value`)."""
     monkeypatch.setenv("LEVBENCH_LOCAL_API_KEY", "")
     client, _ = runner.build_client("lev")
+    assert isinstance(client, TypeSafeClient)
     assert client._config.api_key == "local", (
         f"empty env var leaked through as {client._config.api_key!r}"
     )
@@ -235,27 +241,18 @@ def _write_task_file(path, question_type="choice", n=5):
     return path
 
 
-def test_eval_runs_over_a_generated_task_file(tmp_path) -> None:
-    """The lev -> levbench seam: the harness reads back and scores the kind of
-    file `lev data eval` writes."""
-    items, questions = dataset(_write_task_file(tmp_path / "gen.json"))
-    report = runner.run_eval(fake_client(), "jev", "jev-latest", items, questions)
+@pytest.mark.parametrize("question_type", ["choice", "score", "noul"])
+def test_eval_runs_over_a_generated_task_file(tmp_path, question_type) -> None:
+    items, questions = dataset(_write_task_file(tmp_path / "gen.json", question_type))
+    assert questions["q"].type == question_type
+    report = runner.run_eval(fake_client(), "jev", runner.JEV_DEFAULT, items, questions)
     assert len(report.calls) == 5
     assert set(report.per_question) == {"q"}
+    assert report.per_question["q"] is not None
     assert "accuracy" in runner.format_report(report)
 
 
-@pytest.mark.parametrize("question_type", ["choice", "score", "noul"])
-def test_every_primitive_round_trips_through_a_task_file(tmp_path, question_type) -> None:
-    items, questions = load_task_file(_write_task_file(tmp_path / "g.json", question_type))
-    assert questions["q"].type == question_type
-    report = runner.run_eval(fake_client(), "jev", "jev-latest", items, questions)
-    assert report.per_question["q"] is not None
-
-
 def test_a_task_file_labelling_an_undefined_question_raises(tmp_path) -> None:
-    """Otherwise the label is silently dropped and the eval scores fewer items
-    than it was given."""
     path = tmp_path / "bad.json"
     path.write_text(
         json.dumps(
@@ -280,9 +277,8 @@ def test_detectable_difference_shrinks_with_n() -> None:
     assert detectable_difference(0) == 1.0
 
 
+# Grouping by candidate-set size can expose a formula that pooled samples hide.
 def test_pooling_can_hide_a_formula_that_holds_per_candidate_set_size() -> None:
-    """The live Jev run's shape: nothing matched pooled, and the pooled view could not
-    say which samples broke it."""
     four = [0.7, 0.1, 0.1, 0.1]
     three = [0.5, 0.3, 0.2]
     samples = [(four, confidence_id.max_prob(four))] * 6
@@ -306,18 +302,17 @@ def test_worst_residuals_surfaces_the_samples_that_break_a_candidate() -> None:
     distribution, reported, predicted = worst[0]
     assert distribution == breaks_it
     assert reported == 0.99
-    assert abs(predicted - 0.5) < 1e-9
+    assert predicted == pytest.approx(0.5, abs=1e-9, rel=0)
 
 
+# Incomplete distributions can distort confidence formulas independently of fit.
 def test_diagnosis_reports_whether_distributions_are_complete() -> None:
-    """A truncated distribution makes every candidate wrong for the same reason."""
     truncated = [([0.6, 0.3], 0.6)]
     assert "sum to 1 within 0.1" in confidence_id.format_diagnosis(truncated)
 
 
+# Normalized max probability amplifies rounding by K/(K-1).
 def test_tolerance_accounts_for_how_much_a_statistic_amplifies_rounding() -> None:
-    """Jev rounds to 2 dp and `norm_max_prob` amplifies that by K/(K-1) to 0.010, so a
-    flat 5e-3 threshold rejected the correct formula."""
     rng = random.Random(0)
     samples = []
     for size in (4, 3):
@@ -355,7 +350,7 @@ class TestConcurrentEval:
 
         class ConcurrentStub:
             def system_one(self, state, questions):
-                # All four workers must enter before any request can finish.
+                # The barrier makes serial execution fail instead of passing unnoticed.
                 barrier.wait(timeout=5)
                 return SimpleNamespace(
                     answers={
@@ -375,12 +370,11 @@ class TestConcurrentEval:
 
 class TestCostAccounting:
     def test_cost_is_per_million_tokens_at_list_price(self) -> None:
-        assert cost_usd("jev-latest", 1_000_000, 0) == pytest.approx(0.042)
+        assert cost_usd(JEV_VERSION, 1_000_000, 0) == pytest.approx(0.042)
         assert cost_usd("claude-opus-5", 1_000_000, 1_000_000) == pytest.approx(30.0)
         assert cost_usd("Qwen/Qwen3.5-4B", 1_000_000, 1_000_000) == 0.0, "self-hosted is unmetered"
 
     def test_billed_totals_win_over_base_counts(self) -> None:
-        """The adapter's `*_total` fields include retried attempts -- what is billed."""
         usage = SimpleNamespace(
             input_tokens=10, input_tokens_total=25, output_tokens=2, output_tokens_total=4
         )
@@ -390,15 +384,10 @@ class TestCostAccounting:
         with pytest.raises(ValueError, match="refusing to assume 0 tokens"):
             runner._usage_ints(SimpleNamespace(input_tokens=None, output_tokens=None))
 
+    # Pricing uses the requested model, so a substitution has to be reported.
     def test_a_substituted_model_is_flagged_in_the_report(self) -> None:
-        """Pricing uses the requested model; if the server answered with another,
-        the report has to say so."""
-        report = runner.EvalReport(backend="jev", model="jev-latest")
-        report.calls.append(runner.CallResult({}, 0.3, "jev-1.13.0", 10, 1))
-        assert "requested 'jev-latest' but server served ['jev-1.13.0']" in runner.format_report(
+        report = runner.EvalReport(backend="jev", model="jev-1.12")
+        report.calls.append(runner.CallResult({}, 0.3, JEV_VERSION, 10, 1))
+        assert "requested 'jev-1.12' but server served ['jev-1.13.0']" in runner.format_report(
             report
         )
-
-
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))

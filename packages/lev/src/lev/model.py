@@ -33,6 +33,9 @@ from .types import (
 
 _QUESTIONS = TypeAdapter(dict[str, Question])
 
+# Padded-token budget shared by batching and Score-order averaging.
+MAX_BATCH_TOKENS = 16384
+
 
 @dataclass
 class EngineConfig:
@@ -46,18 +49,21 @@ class EngineConfig:
     noul_readout: Literal["rating", "binary"] = "rating"
     # A second option order reduces letter-position bias; costs one extra batch row.
     order_average: bool = True
+    # Score averaging adds reversed (2 rows) or cyclic (K rows) orders absent from training.
+    score_order_average: Literal["off", "reversed", "cyclic"] = "off"
+    # Reject over-budget requests only when Score averaging added rows.
+    max_batch_tokens: int | None = MAX_BATCH_TOKENS
     # Serving can skip split codes; training keeps large sets for Mode B (ADR-028).
     skip_multi_token_codes: bool = True
     # Forking avoids repeated prefix work but adds a forward and cache copies (ADR-023).
     prefix_mode: Literal["fork", "single"] = "single"
-    # Off because it measured slower on this backbone (ADR-023). When enabled,
-    # inputs are padded to shape buckets and warmup captures graphs at startup.
+    # Opt-in compilation uses shape buckets; measured slower than eager (ADR-023).
     compile: bool = False
     pad_to: int = 32
 
 
+# Rounding up to a multiple gives graph capture a stable set of shapes.
 def bucket(n: int, multiple: int) -> int:
-    """`n` rounded up to a multiple; a stable set of shapes for graph capture."""
     return max(multiple, ((n + multiple - 1) // multiple) * multiple)
 
 
@@ -67,8 +73,6 @@ def pow2(n: int) -> int:
 
 @dataclass(frozen=True)
 class Variant:
-    """One rendering of one question: the candidate order shown, and its suffix."""
-
     name: str
     order: list[int] | None
     suffix_ids: list[int]
@@ -76,8 +80,6 @@ class Variant:
 
 @dataclass(frozen=True)
 class Prepared:
-    """One request validated, routed and tokenised, ready to share a forward."""
-
     questions: dict[str, Question]
     routes: dict[str, Route]
     prefix_ids: list[int]
@@ -96,12 +98,8 @@ class Prepared:
         return any(r.mode is Mode.CANDIDATE_PATH for r in self.routes.values())
 
 
+# Average probabilities, not logits.
 def average_orders(prob_rows: list[list[float]], orders: list[list[int] | None]) -> list[float]:
-    """Map each rendered-order distribution back to canonical order and average.
-
-    `probs[j]` belongs to canonical slot `order[j]`; averaging probabilities, not
-    logits, keeps the result a distribution.
-    """
     if len(prob_rows) != len(orders):
         raise ValueError("one order per probability row")
     k = len(prob_rows[0])
@@ -112,10 +110,10 @@ def average_orders(prob_rows: list[list[float]], orders: list[list[int] | None])
     return [t / len(prob_rows) for t in total]
 
 
+# Shared with `lev route`, so its preview matches serving.
 def serving_routes(
     questions: dict[str, Question], tokenizer, config: EngineConfig
 ) -> dict[str, Route]:
-    """Resolve the serving routes, also exposed by `lev route`."""
     return route_all(
         questions,
         tokenizer,
@@ -127,8 +125,7 @@ def serving_routes(
 
 
 class DecisionEngine:
-    """Answers typed questions about a state in one forward pass; `answer` puts
-    several prepared requests in the same forward."""
+    """Answer typed questions, batching prepared requests into shared forwards."""
 
     def __init__(
         self,
@@ -146,17 +143,15 @@ class DecisionEngine:
         self.checkpoint: Path | None = None
         self._candidate_cache: dict[tuple[str, ...], Any] = {}
         self._device = getattr(model, "device", None)
-        # One forward at a time: CUDA-graph replay is not thread-safe. The server
-        # batches concurrent requests into one forward instead (`lev.batcher`).
+        # Serialize forwards because CUDA-graph replay is not thread-safe.
         self._lock = threading.Lock()
-        # A fast tokenizer's padding and truncation are shared state: concurrent
-        # calls raise "Already borrowed" or encode with another call's truncation.
+        # Serialize tokenizer access to protect shared padding and truncation settings.
         self._tokenizer_lock = threading.RLock()
-        # The decoder runs alone and `lm_head` projects only the scored
-        # positions: full (rows, width, vocab) logits are GBs at a 248k vocabulary.
         base = model.get_base_model() if hasattr(model, "get_base_model") else model
-        self._decoder = base.get_decoder() if model is not None else None
-        self._lm_head = base.get_output_embeddings() if model is not None else None
+        # Held apart so the head runs on scored positions only (`_project`), instead of
+        # allocating logits for the whole sequence. `Any`: the wrappers are dynamically typed.
+        self._decoder: Any = base.get_decoder() if model is not None else None
+        self._lm_head: Any = base.get_output_embeddings() if model is not None else None
         self._eager_decoder = self._decoder
         if self.config.compile:
             import torch
@@ -174,10 +169,7 @@ class DecisionEngine:
             (2, 512),
         ),
     ) -> float:
-        """Run one forward per shape bucket so compile and graph capture happen
-        before the first request. Returns seconds spent. Falls back to eager,
-        with a warning, if the compiled path fails.
-        """
+        """Warm compiled shape buckets; return elapsed seconds and fall back to eager on failure."""
         import torch
 
         started = time.perf_counter()
@@ -197,21 +189,24 @@ class DecisionEngine:
         return time.perf_counter() - started
 
     def system_one(self, state, questions: Mapping[str, Question | dict]) -> SystemOneResponse:
-        """Answer every question about `state` in one forward pass. Questions may
-        be `Noul`/`Choice`/`Score` objects or the same shapes as plain dicts."""
+        """Answer typed or JSON-shaped questions about a state."""
         return self.answer([self.prepare(state, questions)])[0]
 
     def prepare(self, state, questions: Mapping[str, Question | dict]) -> Prepared:
-        """Validate, route and tokenise one request. Raises `ValueError` or
-        `TypeError` for a malformed one, and `RuntimeError` for one that needs
-        Mode B with no head loaded, before any GPU work."""
+        """Validate and tokenize a request, rejecting malformed input or a missing Mode B head."""
         questions = _QUESTIONS.validate_python(questions)
         with self._tokenizer_lock:
             return self._route_and_tokenise(state, questions)
 
+    def question_rows(self, questions: Mapping[str, Question | dict]) -> dict[str, int]:
+        """Count rendered orders per question under the current routing configuration."""
+        questions = _QUESTIONS.validate_python(questions)
+        with self._tokenizer_lock:
+            routes = serving_routes(questions, self.tokenizer, self.config)
+        return {name: len(self._orders(q, routes[name])) for name, q in questions.items()}
+
     def _route_and_tokenise(self, state, questions: dict[str, Question]) -> Prepared:
         routes = serving_routes(questions, self.tokenizer, self.config)
-
         unsupported = [
             name
             for name, r in routes.items()
@@ -226,11 +221,24 @@ class DecisionEngine:
 
         prefix, variants = self._render(state, questions, routes)
         prefix_ids = self.tokenizer.encode(prefix, add_special_tokens=True)
-        return Prepared(questions, routes, prefix_ids, variants)
+        prepared = Prepared(questions, routes, prefix_ids, variants)
+        added = sum(
+            1 for v in variants if v.order is not None and isinstance(questions[v.name], Score)
+        )
+        limit = self.config.max_batch_tokens
+        # Oversized requests run alone; reject only growth from Score averaging.
+        if limit is not None and added and prepared.rows * prepared.width > limit:
+            raise ValueError(
+                f"this request needs {prepared.rows} rows x {prepared.width} tokens = "
+                f"{prepared.rows * prepared.width} padded tokens, {added} of the rows from "
+                f"score_order_average={self.config.score_order_average!r}, above "
+                f"max_batch_tokens={limit}; send fewer Score questions or a shorter state, "
+                "or average fewer orders"
+            )
+        return prepared
 
     def answer(self, requests: list[Prepared]) -> list[SystemOneResponse]:
-        """Answer prepared requests, in single prefix mode all in one forward.
-        Rows are independent, so batching requests changes no row's inputs."""
+        """Answer prepared requests; single-prefix mode batches them into one forward."""
         logits, hidden = self._forward(requests)
         responses, start = [], 0
         for request in requests:
@@ -276,19 +284,23 @@ class DecisionEngine:
             ),
         )
 
+    # Score levels stay canonical unless Score averaging is enabled (ADR-029).
     def _orders(self, question: Question, route: Route) -> list[list[int] | None]:
-        """Candidate orders to render; None means the original order. Only lettered
-        Choice and binary Noul in state-first layout are reversed (ordered scales
-        keep training's low-to-high order; schema-first shares options)."""
         if (
             not self.config.order_average
             or route.mode is not Mode.LABEL_TOKEN
             or self.config.layout is not Layout.STATE_FIRST
-            or isinstance(question, Score)
-            or (isinstance(question, Noul) and route.reason != BINARY_NOUL)
         ):
             return [None]
         n = len(route.codes or [])
+        if isinstance(question, Score):
+            if self.config.score_order_average == "off" or n < 2:
+                return [None]
+            if self.config.score_order_average == "reversed":
+                return [None, list(reversed(range(n)))]
+            return [None] + [[(j + r) % n for j in range(n)] for r in range(1, n)]
+        if isinstance(question, Noul) and route.reason != BINARY_NOUL:
+            return [None]
         return [None, list(reversed(range(n)))] if n >= 2 else [None]
 
     def _render(
@@ -319,8 +331,7 @@ class DecisionEngine:
             for name, question in questions.items()
             for order in self._orders(question, routes[name])
         ]
-        # Every variant shares one prefix by construction; a mismatch would make
-        # the cache wrong, not just slow.
+        # Variants must share a prefix for cache reuse to be valid.
         prefixes = {r.prefix for _, _, r in rendered}
         if len(prefixes) != 1:
             raise AssertionError(f"layout produced {len(prefixes)} prefixes, expected 1")
@@ -329,9 +340,8 @@ class DecisionEngine:
             for name, order, r in rendered
         ]
 
+    # Last-token logits (N, V) and optional hidden states (N, H), in request order.
     def _forward(self, requests: list[Prepared]):
-        """Logits `(N, V)` and, for Mode B, hidden states `(N, H)` at every
-        variant's last token, rows in request order."""
         import torch
 
         want_hidden = any(r.want_hidden for r in requests)
@@ -344,13 +354,12 @@ class DecisionEngine:
             for r in requests
         ]
         logits = torch.cat([logits for logits, _ in outs])
-        hidden = torch.cat([hidden for _, hidden in outs]) if want_hidden else None
+        hidden = (
+            torch.cat([hidden for _, hidden in outs if hidden is not None]) if want_hidden else None
+        )
         return logits, hidden
 
     def _forward_single(self, rows: list[list[int]], want_hidden: bool):
-        """One right-padded batch of prefix+suffix rows. Under `compile`, rows pad to
-        a power of two and width to `pad_to`, so few graphs are recorded; padding
-        changes no real row, since right padding is masked and rows are independent."""
         import torch
 
         device = self._device
@@ -372,7 +381,6 @@ class DecisionEngine:
             return self._project(states, last_positions, want_hidden)
 
     def _forward_forked(self, prefix_ids: list[int], suffixes: list[list[int]], want_hidden: bool):
-        """Prefill the prefix once, then run all suffixes against forked caches."""
         import torch
 
         device = self._device
@@ -403,15 +411,14 @@ class DecisionEngine:
             return self._project(states, [len(s) - 1 for s in suffixes], want_hidden)
 
     def _project(self, states, last_positions: list[int], want_hidden: bool):
-        """Gather each row's last real token and project only those to the vocabulary."""
         import torch
 
         rows = torch.arange(states.size(0), device=states.device)
         last = states[rows, torch.tensor(last_positions, device=states.device)]  # (N, H)
         return self._lm_head(last), (last if want_hidden else None)
 
+    # `logits` is (V,); `hidden` is (H,) or None.
     def _scores(self, logits, hidden, route: Route, question: Question) -> list[float]:
-        """Scores for one variant row: `logits` is `(V,)`, `hidden` `(H,)` or None."""
         if route.mode is Mode.LABEL_TOKEN:
             return self._label_token_scores(logits, route)
         return self._candidate_path_scores(hidden, question)
@@ -423,6 +430,7 @@ class DecisionEngine:
             self.tokenizer, prefix=label_prefix(Style(self.config.prompt_style))
         )
         with self._tokenizer_lock:
+            assert route.codes is not None, "Mode A requires label codes"
             candidate_ids = readout.candidate_ids(route.codes)
         return logits[candidate_ids].float().tolist()
 
@@ -443,10 +451,8 @@ class DecisionEngine:
             )
         return scores[0].float().tolist()
 
+    # Unbounded cache: meant for fixed schemas, whose candidate set does not grow.
     def _candidate_reprs(self, texts: list[str]):
-        """One hidden vector per candidate string, cached per candidate set. The cache
-        is unbounded: fine for fixed schemas (151 candidates ~1.5 MB), not for
-        arbitrary caller-supplied option sets."""
         import torch
 
         key = tuple(texts)
@@ -480,7 +486,7 @@ class DecisionEngine:
         if isinstance(question, Choice):
             distribution = dict(zip(question.criteria, probs, strict=True))
             return ChoiceAnswer(
-                choice=max(distribution, key=distribution.get),
+                choice=max(distribution, key=distribution.__getitem__),
                 probabilities=distribution,
                 confidence=confidence,
             )
@@ -496,8 +502,7 @@ class DecisionEngine:
 
         if isinstance(question, Noul):
             if route.reason == BINARY_NOUL:
-                # Two lettered options, yes first; no rating distribution exists,
-                # so `probabilities` stays absent.
+                # Binary Noul has no rating distribution.
                 return NoulAnswer(noul=probs[0], probabilities=None, confidence=confidence)
             by_rating = dict(enumerate(probs))
             return NoulAnswer(
@@ -520,30 +525,32 @@ def load(
     compile: bool = False,
     max_label_options: int | None = None,
     skip_multi_token_codes: bool = True,
+    score_order_average: Literal["off", "reversed", "cyclic"] = "off",
+    max_batch_tokens: int | None = MAX_BATCH_TOKENS,
+    merge_adapter: bool = True,
+    adapter_scale: float | None = None,
 ) -> DecisionEngine:
-    """Load a checkpoint -- a release directory, a training output or a Hub id --
-    into a ready `DecisionEngine`. With no checkpoint, serves `model_id` frozen.
+    """Load an engine from a release, training output, or Hub id; otherwise use the frozen base.
 
-        engine = lev.load("interfaze-ai/lev")
-        engine.system_one(state, {"urgent": {"type": "noul", "instructions": "..."}})
+    Release metadata overrides the base model and prompt style. Load the checkpoint's
+    tokenizer, head, and calibration when present; warn if calibration is missing.
 
-    A release's `lev_release.json` names the base model and prompt style its
-    weights were trained under and overrides `model_id` and `prompt_style`. The
-    Mode B head and `calibration.json` beside the adapter are picked up; a
-    missing calibration is warned about, not hidden.
-    """
+    `adapter_scale` overrides the manifest's `adapter_scale`, a multiplier on the adapter's
+    trained strength: below 1.0 it interpolates back toward the frozen backbone, trading
+    in-distribution accuracy for out-of-distribution robustness (FINDINGS.md §19)."""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from .train.checkpoints import CALIBRATION, resolve_checkpoint
 
-    # A checkpoint holds a LoRA adapter, not a full model: load the base from
-    # `model_id`, then apply the adapter.
+    # Load the base model before applying the checkpoint's adapter.
     resolved = resolve_checkpoint(checkpoint, cache_dir) if checkpoint else None
     manifest_file = resolved / "lev_release.json" if resolved else None
+    released_scale = 1.0
     if manifest_file and manifest_file.is_file():
         manifest = json.loads(manifest_file.read_text())
         prompt_style = manifest.get("prompt_style", prompt_style)
+        released_scale = float(manifest.get("adapter_scale", 1.0))
         if manifest["base_model"] != model_id:
             print(
                 f"release manifest names base {manifest['base_model']!r}; "
@@ -551,8 +558,7 @@ def load(
             )
             model_id = manifest["base_model"]
 
-    # The checkpoint's own tokenizer when saved: Mode A reads specific token ids,
-    # so a mismatched tokenizer gives plausible wrong answers, not an error.
+    # Use the saved tokenizer to preserve Mode A label ids.
     tok_source = resolved if resolved and (resolved / "tokenizer.json").is_file() else model_id
     tokenizer = AutoTokenizer.from_pretrained(str(tok_source), cache_dir=cache_dir)
 
@@ -570,12 +576,17 @@ def load(
     if resolved:
         from peft import PeftModel
 
+        # Merge to reduce launches and fix graph weights; keep separate for adapter-scale sweeps.
         model = PeftModel.from_pretrained(model, str(resolved))
+        scale = released_scale if adapter_scale is None else adapter_scale
+        if scale != 1.0:
+            _set_adapter_scale(model, scale)
+        if merge_adapter:
+            model = model.merge_and_unload()
         head = _load_head(resolved / MODE_B_HEAD, model)
     model = model.eval()
 
-    # Default to the profile sitting beside the weights it was fitted for:
-    # inside a flat release directory, or one level up in a training tree.
+    # Use calibration beside release weights or above training checkpoints.
     if calibration is None and resolved:
         candidates = [resolved / CALIBRATION, resolved.parent / CALIBRATION]
         calibration = next((c for c in candidates if c.is_file()), candidates[-1])
@@ -588,13 +599,14 @@ def load(
 
     config = EngineConfig(
         model_id=model_id,
-        # A stock checkpoint pins the 0-8 rating scale at one end regardless of
-        # content (ADR-007), so untrained serving reads Noul as two options.
+        # Use binary Noul for untrained backbones with unreliable rating scales (ADR-007).
         noul_readout=noul_readout or ("rating" if resolved else "binary"),
         compile=compile,
         prompt_style=prompt_style or "plain",
         max_label_options=max_label_options,
         skip_multi_token_codes=skip_multi_token_codes,
+        score_order_average=score_order_average,
+        max_batch_tokens=max_batch_tokens,
     )
     engine = DecisionEngine(model, tokenizer, config, profile, mode_b_head=head)
     engine.checkpoint = resolved
@@ -603,8 +615,19 @@ def load(
     return engine
 
 
+# Scale before any merge, which bakes the current scale into the weights.
+def _set_adapter_scale(model, scale: float) -> None:
+    from peft.tuners.lora import LoraLayer
+
+    layers = [m for m in model.modules() if isinstance(m, LoraLayer)]
+    if not layers:
+        raise RuntimeError(f"adapter_scale {scale} requested, but the model has no LoRA layers")
+    for layer in layers:
+        for adapter in layer.scaling:
+            layer.set_scale(adapter, scale)
+
+
 def _load_head(path: Path, model):
-    """Load the saved Mode B head, or return None for Mode A-only serving."""
     import torch
 
     from .readout.mode_b import CandidatePathReadout
@@ -620,18 +643,12 @@ def _load_head(path: Path, model):
     return head.to(device=next(model.parameters()).device, dtype=torch.float32).eval()
 
 
+# Binary Noul calibration is kept separate from the trained rating scale.
 def _bucket_type(question: Question, route: Route) -> str:
-    """Keep binary Noul calibration separate from the trained rating scale."""
     return "noul_binary" if route.reason == BINARY_NOUL else question.type
 
 
 def _fork(cache, n: int, device=None):
-    """Copy a batch-1 prefix cache and expand it to `n` rows.
-
-    `reorder_cache` supports both full- and linear-attention layers;
-    `batch_repeat_interleave` does not. Copy first because reordering mutates
-    the cache and the original must stay reusable.
-    """
     import torch
 
     forked = copy.deepcopy(cache)
@@ -641,7 +658,6 @@ def _fork(cache, n: int, device=None):
 
 
 def _gini(probs: list[float]) -> float:
-    """Normalised Gini concentration: uniform -> 0, point mass -> 1."""
     k = len(probs)
     if k <= 1:
         return 1.0

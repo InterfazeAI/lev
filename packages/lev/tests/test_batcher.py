@@ -14,10 +14,8 @@ def request(name: str, rows: int = 1, width: int = 10):
     return SimpleNamespace(name=name, rows=rows, width=width)
 
 
+# Holds the first forward so later requests queue behind it.
 class GatedEngine:
-    """Records each forward's requests; the first forward waits for `release`,
-    so requests submitted meanwhile queue up behind it."""
-
     def __init__(self):
         self.forwards: list[list[str]] = []
         self.started = threading.Event()
@@ -34,7 +32,6 @@ class GatedEngine:
 
 
 async def submit_while_busy(batcher, engine, first, queued):
-    """Occupy the worker with `first` and queue `queued` behind it."""
     head = asyncio.ensure_future(batcher.submit(first))
     while not engine.started.is_set():
         await asyncio.sleep(0.001)
@@ -149,9 +146,8 @@ def test_a_failed_batch_is_retried_one_request_at_a_time():
     assert after == "answer to c", "the worker survives a failed forward"
 
 
+# Every forward waits for one `step()`, so a test controls when each runs.
 class SteppedEngine:
-    """Every forward waits for one `step()`, so a test controls when each runs."""
-
     def __init__(self, fail_with: BaseException | None = None, short_by: int = 0):
         self.forwards: list[list[str]] = []
         self.calls = 0
@@ -185,8 +181,6 @@ async def until(condition, timeout=2.0):
 
 
 def test_a_held_request_can_still_be_cancelled_before_it_runs():
-    """With a budget of one row, `c` is held back while `b` runs; its client
-    leaving then must keep it off the GPU."""
 
     async def run():
         engine = SteppedEngine()
@@ -231,9 +225,8 @@ def test_a_held_request_past_its_deadline_times_out_without_running():
     assert asyncio.run(run()).forwards == [["a"], ["b"]]
 
 
+# Disconnecting does not release GPU capacity already in use.
 def test_an_abandoned_running_request_still_counts_as_pending():
-    """A client leaving does not free the GPU, so it must not free a slot."""
-
     async def run():
         engine = SteppedEngine()
         batcher = Batcher(engine)
@@ -252,8 +245,6 @@ def test_an_abandoned_running_request_still_counts_as_pending():
 
 
 def test_a_failing_disconnect_watch_still_returns_the_answer():
-    """A server whose `receive()` raises cannot report disconnects; the request
-    must be answered, not dropped as if its client had left."""
 
     async def broken_watch():
         raise RuntimeError("receive() is not available")
@@ -269,10 +260,8 @@ def test_a_failing_disconnect_watch_still_returns_the_answer():
     assert asyncio.run(run()) == "answer to a"
 
 
+# A short response list trips zip(strict=True) outside the forward's error handling.
 def test_an_error_outside_the_forward_fails_its_batch_and_the_worker_keeps_serving():
-    """One answer short trips the `zip(strict=True)` after the forward, outside
-    the forward's own error handling."""
-
     async def run():
         engine = SteppedEngine(short_by=1)
         batcher = Batcher(engine)

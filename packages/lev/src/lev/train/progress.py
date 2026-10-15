@@ -5,14 +5,8 @@ from __future__ import annotations
 import time
 
 
+# Throughput counts real tokens, not padding.
 class ProgressLog:
-    """Periodic one-line progress, flushed: on Modal stdout is the only view, and it is
-    block-buffered when not a tty.
-
-    Losses are per mode (Mode B starts near `ln(K)`). Throughput counts real tokens from the
-    attention mask, so it can contradict a wrong plan (ADR-016).
-    """
-
     def __init__(self, total_steps: int, log_every: int):
         self.total = total_steps
         self.every = max(1, log_every)
@@ -31,8 +25,7 @@ class ProgressLog:
 
         now = time.monotonic()
         elapsed = max(now - self.start, 1e-9)
-        # Over the window, not since start: startup skews a cumulative rate ~8x (ADR-017).
-        # A coarse clock can report zero on a fast window; never divide by it.
+        # Use windowed rates to exclude startup delay; guard against zero elapsed time.
         span = max(now - self.mark, 1e-9)
         rate = (done - self.mark_step) / span
         remaining = (self.total - done) / rate if rate else 0.0

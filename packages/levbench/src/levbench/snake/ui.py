@@ -1,10 +1,6 @@
-"""A fixed-cell terminal composition, shared by the live display and replay.
+"""Live and replay terminal display adapted from laya-mlx (Apache-2.0).
 
-laya-mlx's layout (Apache-2.0), with the right-hand panel adapted to a client
-of a remote server: the backend and served model replace the local engine
-lines, and the planner's ground truth sits beside the model's two estimates.
-`rich` is optional: without it the loop prints one status line per step.
-"""
+Show server metadata and planner truth beside model estimates; Rich is optional."""
 
 from __future__ import annotations
 
@@ -94,8 +90,8 @@ def network_label(backend: str, base_url: str | None) -> str:
     return "localhost"
 
 
+# Probabilities describe the displayed board, before its announced next step.
 def compose(game: dict, decision: dict, stats: dict) -> Canvas:
-    """Probabilities describe the displayed board, before its announced next step."""
     width, height = layout_size(game["width"], game["height"])
     c = Canvas(width, height)
     left, right, top = 3, max(58, game["width"] * 2 + 10), 6
@@ -212,7 +208,7 @@ def compose(game: dict, decision: dict, stats: dict) -> Canvas:
     c.put(height - 2, left, "SPACE pause   +/- speed   R reset   Q quit", MUTED)
     elapsed = stats.get("elapsed", 0.0)
     clock = f"{int(elapsed) // 60:02d}:{int(elapsed) % 60:02d}"
-    c.put(height - 2, right, f"ESTIMATES BY THE MODEL       {clock}", MUTED)
+    c.put(height - 2, right, f"{'ESTIMATES BY THE MODEL':<29}{clock}", MUTED)
     return c
 
 
@@ -231,8 +227,6 @@ def status_line(game: dict, decision: dict, stats: dict) -> str:
 
 
 class Keyboard:
-    """Non-blocking single-key reads from a TTY; a no-op anywhere else."""
-
     def __enter__(self):
         self.saved = None
         if sys.stdin.isatty():

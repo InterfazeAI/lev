@@ -1,21 +1,16 @@
-"""Training presets and approximate H100 compute and memory budgets.
-
-Estimate assumptions are documented in docs/ARCHITECTURE.md §5.
-"""
+"""Training presets and approximate H100 budgets (ARCHITECTURE §5)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal
 
-# Measured on the released 4b-instruct run (2.46e18 FLOPs in 7.8 h, padding and overhead
-# included); reads high for the plain-prompt 4B runs (4h50, 5h53). docs/TRAINING.md.
+# Effective throughput measured on the 4b-instruct run, including overhead (TRAINING.md).
 H100_EFFECTIVE_FLOPS = 8.75e13
 
 H100_VRAM_GB = 80.0
 
-# ~6*N FLOPs/token forward+backward, plus ~a third for checkpointing's recompute. Holds
-# under LoRA: backward still traverses the frozen weights to reach the adapters.
+# Include checkpoint recomputation; LoRA backward still traverses frozen weights.
 FLOPS_PER_PARAM_PER_TOKEN = 8.0
 
 
@@ -85,7 +80,7 @@ class TrainConfig:
 
     @property
     def tokens_per_step(self) -> int:
-        # The work per step is the padded batch, not `max_seq_len` (~16x larger).
+        # Estimate compute from padded batch length, not the truncation cap.
         return self.avg_tokens_per_example * self.per_device_batch * self.grad_accum
 
     @property
@@ -128,18 +123,18 @@ class TrainConfig:
         prompt = f"{self.prompt_style} prompts, Mode A to the tokenizer limit"
         return "\n".join(
             [
-                f"model            {self.model_id}  ({self.params_b}B, {self.dtype})",
-                f"adaptation       {adaptation}",
-                f"prompt           {prompt}",
-                f"data             {self.n_examples:,} examples x "
+                f"{'model':<17}{self.model_id}  ({self.params_b}B, {self.dtype})",
+                f"{'adaptation':<17}{adaptation}",
+                f"{'prompt':<17}{prompt}",
+                f"{'data':<17}{self.n_examples:,} examples x "
                 f"{self.avg_tokens_per_example} tok x {self.epochs} epochs"
                 f"  = {self.total_tokens / 1e9:.2f}B tokens",
-                f"steps            {self.total_steps:,} "
+                f"{'steps':<17}{self.total_steps:,} "
                 f"({self.examples_per_step} ex/step, ~{self.tokens_per_step:,} tok/step)",
-                f"compute          {self.total_flops:.2e} FLOPs",
-                f"H100 estimate    {self.estimated_hours:.1f} hours "
+                f"{'compute':<17}{self.total_flops:.2e} FLOPs",
+                f"{'H100 estimate':<17}{self.estimated_hours:.1f} hours "
                 f"({self.estimated_hours / 24:.1f} days)",
-                f"memory           {self.optimizer_gb:.1f} GB state, "
+                f"{'memory':<17}{self.optimizer_gb:.1f} GB state, "
                 f"{self.headroom_gb:.1f} GB headroom of {H100_VRAM_GB:.0f} GB",
             ]
         )

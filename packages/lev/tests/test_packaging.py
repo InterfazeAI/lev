@@ -1,4 +1,4 @@
-"""Docs run commands from the repo root, so an extra defined only on a member is unreachable."""
+"""Test workspace extras and documented commands from the repository root."""
 
 from __future__ import annotations
 
@@ -20,16 +20,21 @@ def _extras(pyproject: Path) -> set[str]:
     return set(data.get("project", {}).get("optional-dependencies", {}))
 
 
-def _documented_extras() -> dict[str, set[str]]:
-    found: dict[str, set[str]] = {}
+def _doc_sources() -> list[Path]:
     sources = [ROOT / "README.md", ROOT / "Makefile", ROOT / "CONTRIBUTING.md"]
-    sources += sorted((ROOT / "docs").glob("*.md"))
-    for src in sources:
-        if not src.is_file():
-            continue
-        for name in re.findall(r"--extra[= ]([a-z][a-z0-9-]*)", src.read_text()):
-            found.setdefault(name, set()).add(src.name)
+    return [p for p in sources + sorted((ROOT / "docs").glob("*.md")) if p.is_file()]
+
+
+def _documented_values(pattern: str) -> dict[str, set[str]]:
+    found: dict[str, set[str]] = {}
+    for src in _doc_sources():
+        for value in re.findall(pattern, src.read_text()):
+            found.setdefault(value, set()).add(src.name)
     return found
+
+
+def _documented_extras() -> dict[str, set[str]]:
+    return _documented_values(r"--extra[= ]([a-z][a-z0-9-]*)")
 
 
 def test_root_forwards_every_member_extra():
@@ -58,8 +63,6 @@ def test_known_extras_are_present(expected):
 
 
 def _inspect_cli(tool: str) -> tuple[set[str], dict[str, set[str]]]:
-    """Introspects the real parser rather than regexing the source, so it checks what the
-    parser actually accepts."""
     import argparse
     import importlib
 
@@ -92,21 +95,10 @@ def _inspect_cli(tool: str) -> tuple[set[str], dict[str, set[str]]]:
     return subcommands, choices
 
 
-def _documented_flag_values(flag: str) -> dict[str, set[str]]:
-    found: dict[str, set[str]] = {}
-    sources = [ROOT / "README.md", ROOT / "Makefile", ROOT / "CONTRIBUTING.md"]
-    sources += sorted((ROOT / "docs").glob("*.md"))
-    for src in sources:
-        if src.is_file():
-            for value in re.findall(rf"{flag}[= ]([a-z][a-z0-9-]*)", src.read_text()):
-                found.setdefault(value, set()).add(src.name)
-    return found
-
-
 def test_every_documented_backend_exists():
     _, choices = _inspect_cli("levbench")
     accepted = choices["--backend"]
-    for value, where in sorted(_documented_flag_values("--backend").items()):
+    for value, where in sorted(_documented_values(r"--backend[= ]([a-z][a-z0-9-]*)").items()):
         assert value in accepted, (
             f"{sorted(where)} document `--backend {value}`, but the CLI accepts "
             f"only {sorted(accepted)}."
@@ -117,20 +109,12 @@ CODE_SPANS = re.compile(r"```[a-z]*\n(.*?)```|`([^`\n]+)`", re.S)
 
 
 def _documented_commands(tool: str) -> dict[str, set[str]]:
-    """Only fenced blocks and inline backticks count; prose like "levbench must not import
-    lev" would otherwise match."""
     found: dict[str, set[str]] = {}
-    sources = [ROOT / "README.md", ROOT / "Makefile", ROOT / "CONTRIBUTING.md"]
-    sources += sorted((ROOT / "docs").glob("*.md"))
     pattern = re.compile(rf"(?:^|\s)(?:uv run )?{tool} ([a-z][a-z0-9-]*)", re.M)
-    for src in sources:
-        if not src.is_file():
-            continue
+    for src in _doc_sources():
         text = src.read_text()
-        # A Makefile is all code apart from its `## help text`, which is prose
-        # and mentions commands the way a sentence does.
         code = (
-            [re.sub(r"##.*", "", text)]
+            [text]
             if src.suffix != ".md"
             else [block or span for block, span in CODE_SPANS.findall(text)]
         )
